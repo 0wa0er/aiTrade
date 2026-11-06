@@ -1,0 +1,20 @@
+{
+  "commissionRate": 0.00025,
+  "commissionMin": 5,
+  "etfCommissionRate": 0.00025,
+  "etfCommissionMin": 5,
+  "stampRate": 0.0005,
+  "transferRate": 0.00001,
+  "fundBuyFee": 0.0015,
+  "fundRedeemTiers": [
+    { "maxDays": 7, "rate": 0.015 },
+    { "maxDays": 365, "rate": 0.005 },
+    { "maxDays": 730, "rate": 0.0025 },
+    { "maxDays": 100000, "rate": 0 }
+  ],
+  "dividendTaxTiers": [
+    { "maxDays": 30, "rate": 0.2 },
+    { "maxDays": 365, "rate": 0.1 },
+    { "maxDays": 100000, "rate": 0 }
+  ]
+}

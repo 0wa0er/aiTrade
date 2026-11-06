@@ -1,0 +1,24 @@
+{
+  "_说明": "自动盯盘的风控红线。改动此文件后无需重启服务，下一次任务执行即生效。金额单位为元。",
+  "enabled": true,
+  "risk": {
+    "maxPositions": 3,
+    "maxSinglePct": 0.3,
+    "minTradeAmount": 10000,
+    "minCashPct": 0.08,
+    "maxDailyBuyPct": 0.3,
+    "stopLossPct": -0.07,
+    "takeProfitPct": 0.15,
+    "maxPricePerShare": 130,
+    "forbidST": true,
+    "forbidFund": true
+  },
+  "scan": {
+    "minPrice": 3,
+    "maxPrice": 130,
+    "minAmountYi": 2,
+    "pctRange": [-4, 6],
+    "excludeBoards": ["688", "8", "4", "9", "1"]
+  },
+  "journalDir": "data/journal"
+}
