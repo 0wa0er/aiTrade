@@ -103,6 +103,19 @@ node server.js                         # 前台起服务（NO_OPEN=1 不开浏�
 
 改规则、改目录、改流程时，**同步更新本文件与 `data/journal/README.md`**，并在 `CHANGELOG.md` 记一条。文档过期比没有文档更危险。
 
+## 8. 版本控制
+
+仓库 `main` 单分支，本地无远端。提交按**功能单元**切，不按文件切。
+
+| 场景 | 做法 |
+|---|---|
+| 改代码 / 规则 / 配置 | 先跑 `npm test`，**通过才提交**；message 写清改了什么、为什么 |
+| 只改业务日志 | 可单独提交，如 `log: 2026-11-09 收盘复盘与次日预案` |
+| 交易引起的账户变化 | **不提交**，`data/state.json` 已在 `.gitignore` |
+
+- `state.json` 不入库：它每个交易日都在变，纳管后提交历史会被账户流水淹没。恢复初始账户：停服务 → `cp data/state.seed.json data/state.json`。
+- 提交前看 `git status`，别把 `state.json`、`.workbuddy/`、临时截图带进去。`public/vendor/` 是第三方文件，除非升级否则不该出现在 diff 里。
+
 ---
 
 **免责声明**：本项目为模拟盘演练与策略验证工具，输出不构成投资建议。
