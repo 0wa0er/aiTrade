@@ -1,0 +1,18 @@
+# ---- 依赖（本项目零依赖运行，预防性忽略）----
+node_modules/
+
+# ---- 运行时账户状态 ----
+# data/state.json 保存现金、持仓、委托、成交，每个交易日都在变。
+# 不纳入版本控制：否则每次交易都会产生 diff，commit 历史会被账户流水淹没。
+# 需要恢复初始账户时：cp data/state.seed.json data/state.json（先停服务）
+data/state.json
+data/state.json.tmp
+data/*.log
+
+# ---- WorkBuddy 运行时数据（记忆、自动化快照）----
+.workbuddy/
+
+# ---- 临时文件 ----
+*.tmp
+.tmp-*
+.shot*.png

@@ -1,0 +1,59 @@
+{
+  "initialCapital": 50000,
+  "cash": 50000,
+  "frozenCash": 0,
+  "watchlist": [
+    {
+      "secid": "1.512890",
+      "code": "512890",
+      "name": "红利低波ETF",
+      "type": "etf"
+    },
+    {
+      "secid": "1.600900",
+      "code": "600900",
+      "name": "长江电力",
+      "type": "stock"
+    },
+    {
+      "secid": "1.601398",
+      "code": "601398",
+      "name": "工商银行",
+      "type": "stock"
+    },
+    {
+      "secid": "1.601728",
+      "code": "601728",
+      "name": "中国电信",
+      "type": "stock"
+    },
+    {
+      "secid": "1.600028",
+      "code": "600028",
+      "name": "中国石化",
+      "type": "stock"
+    },
+    {
+      "secid": "1.510300",
+      "code": "510300",
+      "name": "沪深300ETF",
+      "type": "etf"
+    },
+    {
+      "secid": "1.588000",
+      "code": "588000",
+      "name": "科创50ETF",
+      "type": "etf"
+    }
+  ],
+  "positions": {},
+  "orders": [],
+  "trades": [],
+  "actions": [],
+  "dayStart": {
+    "date": "2026-11-06",
+    "equity": 50000
+  },
+  "seq": 1,
+  "orderSeq": 1
+}
