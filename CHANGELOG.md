@@ -10,7 +10,8 @@
 ## [Unreleased]
 
 ### 新增
-- 初始化 Git 仓库（`main` 单分支，本地无远端）。`.gitignore` 排除运行时账户状态 `data/state.json`（每个交易日都在变，入库会淹没提交历史）、`.workbuddy/`、临时文件与截图；`.gitattributes` 统一源码与日志为 LF，`*.bat` 强制 CRLF。
+- `README.md`：项目说明（对齐实盘的规则表、快速开始、命令行、日志体系、目录结构、已知近似）。
+- 初始化 Git 仓库（`main` 单分支，远端 `github.com/0wa0er/aiTrade`）。`.gitignore` 排除运行时账户状态 `data/state.json`（每个交易日都在变，入库会淹没提交历史）、`.workbuddy/`、临时文件与截图；`.gitattributes` 统一源码与日志为 LF，`*.bat` 强制 CRLF。
 - `data/state.seed.json`：初始账户种子（5 万本金、空仓、7 只自选）。`state.json` 丢失或需重置时：停服务 → `cp data/state.seed.json data/state.json`。
 - `AGENTS.md` 第 8 节「版本控制」：提交粒度按功能单元、改代码先跑测试、日志可单独提交、账户状态不入库。
 
