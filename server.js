@@ -34,6 +34,22 @@ const DATA_DIR = path.join(ROOT, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const HOLIDAY_FILE = path.join(DATA_DIR, 'holidays.json');
 const FEE_FILE = path.join(DATA_DIR, 'fees.json');
+const AUTOTRADE_FILE = path.join(DATA_DIR, 'autotrade.json');
+
+/**
+ * 读取账户交易权限（data/autotrade.json 的 account.permissions）。
+ * 文件缺失或字段缺失时返回 null，由 rules.permissionOf 回落到「新开户」默认值。
+ * 每次现读，改配置无需重启 —— 与 cli.js 的行为保持一致。
+ */
+function loadAccountPermissions() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(AUTOTRADE_FILE, 'utf8'));
+    const p = cfg && cfg.account && cfg.account.permissions;
+    return p && typeof p === 'object' ? p : null;
+  } catch {
+    return null;
+  }
+}
 
 const PORT = Number(process.env.PORT || 5173);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -1109,6 +1125,21 @@ async function submitStockOrder(body, sess, now) {
   if (q.stale) throw new Error('行情数据已过期，已拒绝下单，请稍后重试');
   if (!(q.price > 0)) throw new Error('行情价格无效');
 
+  // ---- 账户资质：未开通的板块禁止买入 ----
+  // 只拦买入。卖出永远放行 —— 否则权限收紧后存量持仓无法退出。
+  if (side === 'buy') {
+    const perm = R.permissionOf({ code, name: q.name || name, type, permissions: loadAccountPermissions() });
+    if (!perm.allowed) {
+      const e = new Error(
+        `账户未开通${perm.label}：需 ${perm.need}。当前为模拟「新开户」账户（5 万本金 / 无交易经验），` +
+          `只能交易沪深主板与场内基金；科创板 ETF、创业板 ETF 不受此限。` +
+          `如确需放开，改 data/autotrade.json 的 account.permissions`
+      );
+      e.code = 'NO_PERMISSION';
+      throw e;
+    }
+  }
+
   const tick = R.tickOf(code, type);
   const lot = R.lotOf(code, type);
   const lim = R.priceLimit({
@@ -1646,7 +1677,9 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/detail') {
     const secid = q.get('secid') || '';
-    const code = q.get('code') || '';
+    // code 可省略，但板块判定（权限/交易单位/涨跌幅）依赖它，缺省时从 secid 反解，
+    // 否则会被当成主板，导致科创板/创业板标的被误判为可买。
+    const code = q.get('code') || String(secid).split('.')[1] || '';
     const type = q.get('type') || 'stock';
     if (type === 'fund') {
       const [{ map }, nav] = await Promise.all([getFunds([code]), getFundNav(code, 180)]);
@@ -1662,7 +1695,19 @@ async function handleApi(req, res, url) {
     }
     return sendJSON(res, 200, {
       ok: true,
-      data: { quote: quote || null, book, bookError, session: sessionState() },
+      data: {
+        quote: quote || null,
+        book,
+        bookError,
+        session: sessionState(),
+        // 当前账户能否买入该标的（前端据此在下单面板提示，避免填完才发现没权限）
+        permission: R.permissionOf({
+          code,
+          name: quote?.name || '',
+          type,
+          permissions: loadAccountPermissions(),
+        }),
+      },
     });
   }
 

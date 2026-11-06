@@ -9,6 +9,7 @@
   --up: #f2504b;
   --down: #22b07a;
   --accent: #4a8cf7;
+  --warn: #e8a33d;
   --radius: 8px;
 }
 
@@ -260,6 +261,7 @@ button.submit:hover { filter: brightness(1.08); }
 button.submit:disabled { opacity: .5; cursor: not-allowed; filter: none; }
 
 .hint { font-size: 10.5px; color: #565e6c; text-align: center; line-height: 1.5; }
+.hint.warn { color: var(--warn); font-weight: 600; }
 
 .book { border-top: 1px solid var(--border); padding: 7px 12px 8px; flex: 1 1 auto; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; }
 .book-head { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--muted); margin-bottom: 3px; flex: 0 0 auto; }

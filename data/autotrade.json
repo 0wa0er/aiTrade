@@ -1,6 +1,41 @@
 {
-  "_说明": "自动盯盘的风控红线。改动此文件后无需重启服务，下一次任务执行即生效。金额单位为元。",
+  "_说明": "自动盯盘的风控红线与账户资质。改动此文件后无需重启服务，下一次任务执行即生效。金额单位为元。",
   "enabled": true,
+  "account": {
+    "_说明": "账户资质。当前为『新开户 + 5 万本金 + 无交易经验』，只能交易沪深主板与场内基金。资产或经验满足门槛后，把对应项改为 true（需符合真实门槛，不要为了多做交易而放宽）。",
+    "openDate": "2026-11-06",
+    "tradeExperienceMonths": 0,
+    "avgAssets20d": 50000,
+    "_permission门槛": {
+      "gem": "日均资产 10 万元 + 24 个月交易经验",
+      "star": "日均资产 50 万元 + 24 个月交易经验",
+      "bse": "日均资产 50 万元 + 24 个月交易经验",
+      "st": "签署风险警示股票风险揭示书",
+      "delisting": "日均资产 50 万元 + 24 个月交易经验 + 风险揭示书",
+      "cbond": "日均资产 10 万元 + 24 个月交易经验",
+      "reits": "签署基础设施基金风险揭示书",
+      "margin": "日均资产 50 万元 + 6 个月交易经验",
+      "hkConnect": "日均资产 50 万元",
+      "option": "日均资产 50 万元 + 6 个月经验 + 知识测试",
+      "nse": "日均资产 100 万 / 200 万元"
+    },
+    "permissions": {
+      "main": true,
+      "etf": true,
+      "fund": true,
+      "gem": false,
+      "star": false,
+      "bse": false,
+      "st": false,
+      "delisting": false,
+      "cbond": false,
+      "reits": false,
+      "margin": false,
+      "hkConnect": false,
+      "option": false,
+      "nse": false
+    }
+  },
   "risk": {
     "maxPositions": 3,
     "maxSinglePct": 0.3,
@@ -18,7 +53,7 @@
     "maxPrice": 130,
     "minAmountYi": 2,
     "pctRange": [-4, 6],
-    "excludeBoards": ["688", "8", "4", "9", "1"]
+    "excludeBoards": ["688", "30", "8", "4", "92"]
   },
   "journalDir": "data/journal"
 }

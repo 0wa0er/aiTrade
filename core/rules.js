@@ -292,6 +292,113 @@ function dividendTaxRate(holdDays, cfg = DEFAULT_FEES) {
   return 0;
 }
 
+// ---------------- 账户交易权限（开户门槛） ----------------
+
+/**
+ * 各板块 / 品种的开通门槛。
+ *
+ * 口径：沪深交易所投资者适当性管理办法（全面注册制后），资产为「申请前 20 个交易日
+ * 日均资产」，不含融资融券融入的资金与证券；经验为「参与证券交易满 N 个月」。
+ *
+ * 关键事实：**新开户账户默认只能交易沪深主板与场内基金**。创业板虽只需 10 万元，
+ * 但同样要求 24 个月交易经验 —— 新开户即使资金够也开不了。这是本项目要拦的第一道门。
+ */
+const PERMISSIONS = {
+  main: { label: '沪深主板', need: null },
+  etf: { label: '场内基金', need: null },
+  fund: { label: '场外基金', need: null },
+  gem: { label: '创业板', need: '日均资产 10 万元 + 24 个月交易经验' },
+  star: { label: '科创板', need: '日均资产 50 万元 + 24 个月交易经验' },
+  bse: { label: '北交所', need: '日均资产 50 万元 + 24 个月交易经验' },
+  st: { label: 'ST / 风险警示板', need: '签署风险警示股票风险揭示书（券商 App 可线上办理）' },
+  delisting: { label: '退市整理期股票', need: '日均资产 50 万元 + 24 个月交易经验 + 风险揭示书' },
+  cbond: { label: '可转债', need: '日均资产 10 万元 + 24 个月交易经验' },
+  reits: { label: '公募 REITs', need: '签署基础设施基金风险揭示书' },
+  margin: { label: '融资融券', need: '日均资产 50 万元 + 6 个月交易经验' },
+  hkConnect: { label: '港股通', need: '日均资产 50 万元' },
+  option: { label: '股票期权', need: '日均资产 50 万元 + 6 个月交易经验 + 知识测试' },
+  nse: { label: '新三板', need: '日均资产 100 万 / 200 万元' },
+};
+
+/** 新开户账户的默认权限：只有主板与场内基金，其余一律未开通 */
+const NEW_ACCOUNT_PERMISSIONS = {
+  main: true,
+  etf: true,
+  fund: true,
+  gem: false,
+  star: false,
+  bse: false,
+  st: false,
+  delisting: false,
+  cbond: false,
+  reits: false,
+  margin: false,
+  hkConnect: false,
+  option: false,
+  nse: false,
+};
+
+/** 可转债代码段：沪市 110/111/113/132（含可交换债），深市 123/127/128 */
+function isConvertibleBond(code) {
+  return /^(11[013]|132|12[378])/.test(String(code || ''));
+}
+
+/** 公募 REITs 代码段：沪市 508xxx，深市 180xxx */
+function isReit(code) {
+  return /^(508|180)/.test(String(code || ''));
+}
+
+/**
+ * 判定某标的在当前账户权限下能否**买入**。
+ *
+ * 注意两点：
+ * 1. 只用于买入。卖出永远允许 —— 否则权限变更后持仓无法退出。
+ * 2. 科创板 ETF、创业板 ETF（如 588000、159915）**不需要**对应板块权限，
+ *    它们是普通场内基金，交易所对二级市场买卖不设适当性门槛。
+ *
+ * @returns {{allowed:boolean, kind:string, label:string, need:string|null, reason:string|null}}
+ */
+function permissionOf({ code, name = '', type = 'stock', permissions } = {}) {
+  const p = { ...NEW_ACCOUNT_PERMISSIONS, ...(permissions || {}) };
+  const c = String(code || '');
+
+  const allow = (kind) => ({ allowed: true, kind, label: (PERMISSIONS[kind] || {}).label || kind, need: null, reason: null });
+  const deny = (kind) => {
+    const m = PERMISSIONS[kind] || { label: kind, need: '未开通' };
+    return { allowed: false, kind, label: m.label, need: m.need, reason: `未开通${m.label}权限（需 ${m.need}）` };
+  };
+
+  // 顺序有意义：退市整理期 > 可转债 > REITs > 板块 > ST
+  if (/退$|退市/.test(name)) return p.delisting ? allow('delisting') : deny('delisting');
+  if (isConvertibleBond(c)) return p.cbond ? allow('cbond') : deny('cbond');
+  if (isReit(c)) return p.reits ? allow('reits') : deny('reits');
+
+  const board = boardOf(c, type);
+  if (board === 'fund') return allow('fund');
+  if (board === 'etf') return allow('etf'); // 含科创/创业 ETF，无需板块权限
+  if (board === 'star') return p.star ? allow('star') : deny('star');
+  if (board === 'gem') return p.gem ? allow('gem') : deny('gem');
+  if (board === 'bse') return p.bse ? allow('bse') : deny('bse');
+  if (/(^|\*)ST/i.test(name)) return p.st ? allow('st') : deny('st');
+  return allow('main');
+}
+
+/** 当前权限下可交易的板块名列表，用于 status 展示 */
+function allowedBoards(permissions) {
+  const p = { ...NEW_ACCOUNT_PERMISSIONS, ...(permissions || {}) };
+  return Object.keys(PERMISSIONS)
+    .filter((k) => p[k])
+    .map((k) => PERMISSIONS[k].label);
+}
+
+/** 未开通项及门槛，用于 status 展示 */
+function deniedBoards(permissions) {
+  const p = { ...NEW_ACCOUNT_PERMISSIONS, ...(permissions || {}) };
+  return Object.keys(PERMISSIONS)
+    .filter((k) => !p[k])
+    .map((k) => ({ label: PERMISSIONS[k].label, need: PERMISSIONS[k].need }));
+}
+
 // ---------------- 基金确认日 ----------------
 
 /**
@@ -324,4 +431,12 @@ module.exports = {
   fundRedeemRate,
   dividendTaxRate,
   fundApplyDate,
+  // 账户权限
+  PERMISSIONS,
+  NEW_ACCOUNT_PERMISSIONS,
+  isConvertibleBond,
+  isReit,
+  permissionOf,
+  allowedBoards,
+  deniedBoards,
 };

@@ -38,6 +38,9 @@ const CFG = {
   },
 };
 
+/** 已开通创业板的配置：仅用于隔离权限影响、单独验证仓位规则（真实新开户账户开不了创业板） */
+const CFG_GEM = { ...CFG, account: { permissions: { gem: true } } };
+
 /** 构造 5 万本金账户的上下文 */
 function ctxOf({ equity = 50000, cash = 50000, positions = [], todayBuy = 0 } = {}) {
   return {
@@ -64,7 +67,7 @@ const q = (price, extra = {}) => ({ price, limitUp: Math.round(price * 1.1 * 100
 
 function buy(o) {
   return guardBuy({
-    cfg: CFG,
+    cfg: o.cfg || CFG,
     ctx: o.ctx || ctxOf(),
     dash: { account: {} },
     quote: o.quote || q(o.price || 10),
@@ -94,8 +97,8 @@ ok('茅台一手 14.5 万，超出单票上限 → 拒绝并说明原因', () =>
   throws(() => buy({ code: '600519', name: '贵州茅台', price: 1453, qty: 100 }), '最小一手');
 });
 
-ok('宁德时代一手 2.5 万，同样超出 → 拒绝', () => {
-  throws(() => buy({ code: '300750', name: '宁德时代', price: 254.22, qty: 100 }), '最小一手');
+ok('宁德时代一手 2.5 万，同样超出 → 拒绝（即使开通创业板也买不了）', () => {
+  throws(() => buy({ code: '300750', name: '宁德时代', price: 254.22, qty: 100, cfg: CFG_GEM }), '最小一手');
 });
 
 ok('单价 50 元买 200 股（1 万）→ 通过', () => {
@@ -113,7 +116,7 @@ ok('刚好 1 万整 → 通过', () => {
 });
 
 ok('买入后该股 1.64 万 > 单票上限 1.5 万 → 拒绝', () => {
-  throws(() => buy({ code: '300274', name: '阳光电源', price: 81.97, qty: 200 }), '超过单票上限');
+  throws(() => buy({ code: '300274', name: '阳光电源', price: 81.97, qty: 200, cfg: CFG_GEM }), '超过单票上限');
 });
 
 ok('已有 3 只持仓时开第 4 只 → 拒绝', () => {
@@ -136,10 +139,6 @@ ok('单日买入已达 2 万上限 → 拒绝下一笔', () => {
   throws(() => buy({ price: 30, qty: 400, ctx: ctxOf({ todayBuy: 19000 }) }), '单日买入上限');
 });
 
-ok('ST 股 → 拒绝', () => {
-  throws(() => buy({ code: '600340', name: '*ST华幸', price: 1.13, qty: 10000 }), 'ST');
-});
-
 ok('股价超过单价上限 130 → 拒绝', () => {
   throws(() => buy({ code: '600900', name: '长江电力', price: 140, qty: 100 }), '单价上限');
 });
@@ -151,6 +150,52 @@ ok('场外基金 → 拒绝自动交易', () => {
 ok('ETF 3000 份 1.2 万 → 通过', () => {
   const amt = buy({ code: '510300', name: '沪深300ETF', type: 'etf', price: 4.124, qty: 3000 });
   assert.ok(Math.abs(amt - 12372) < 1, `实际 ${amt}`);
+});
+
+console.log('\n账户交易权限（新开户：只有主板与场内基金）');
+
+ok('科创板 688 → 拒绝（需 50 万资产 + 24 个月经验）', () => {
+  throws(() => buy({ code: '688981', name: '中芯国际', price: 110, qty: 200 }), '科创板');
+});
+
+ok('创业板 300 → 拒绝（需 10 万资产 + 24 个月经验）', () => {
+  throws(() => buy({ code: '300750', name: '宁德时代', price: 50, qty: 400 }), '创业板');
+});
+
+ok('创业板 301 → 同样拒绝', () => {
+  throws(() => buy({ code: '301236', name: '软通动力', price: 30, qty: 400 }), '创业板');
+});
+
+ok('北交所 830/920 → 拒绝（需 50 万资产 + 24 个月经验）', () => {
+  throws(() => buy({ code: '830799', name: '艾融软件', price: 10, qty: 1200 }), '北交所');
+  throws(() => buy({ code: '920001', name: '北交所新股', price: 10, qty: 1200 }), '北交所');
+});
+
+ok('可转债 → 拒绝（需 10 万资产 + 24 个月经验）', () => {
+  throws(() => buy({ code: '110059', name: '浦发转债', price: 110, qty: 100 }), '可转债');
+});
+
+ok('退市整理期 → 拒绝（需 50 万资产 + 24 个月经验 + 风险揭示书）', () => {
+  throws(() => buy({ code: '600001', name: '某某退', price: 1, qty: 11000 }), '退市整理');
+});
+
+ok('ST 股 → 拒绝（风险警示板需签风险揭示书）', () => {
+  throws(() => buy({ code: '600340', name: '*ST华幸', price: 1.13, qty: 10000 }), '风险警示板');
+});
+
+ok('科创50ETF 588000 → 通过（ETF 不受科创板权限限制）', () => {
+  const amt = buy({ code: '588000', name: '科创50ETF', type: 'etf', price: 1.24, qty: 10000 });
+  assert.ok(amt > 10000, `成交金额 ${amt} 应过 1 万下限`);
+});
+
+ok('主板股票与 ETF 正常放行', () => {
+  assert.ok(buy({ code: '601398', name: '工商银行', price: 8, qty: 1300 }) > 0);
+  assert.ok(buy({ code: '512890', name: '红利低波ETF', type: 'etf', price: 1.24, qty: 10000 }) > 0);
+});
+
+ok('即便开通 ST 权限，仍受风控 forbidST 约束（双层保险）', () => {
+  const cfgST = { ...CFG, account: { permissions: { st: true } } };
+  throws(() => buy({ code: '600340', name: '*ST华幸', price: 1.13, qty: 10000, cfg: cfgST }), '风控禁止');
 });
 
 console.log('\n费用估算与代码映射');

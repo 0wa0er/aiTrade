@@ -44,6 +44,8 @@ const S = {
   bottomView: 'positions',
   book: null,
   bookError: null,
+  permission: null, // 当前标的的账户交易权限（来自 /api/detail）
+  baseHint: '',     // 下单提示的默认文案，权限拦截时会被覆盖
   chart: null,
   chartSeq: 0,
   loading: false,   // 请求中的互斥标记，防止上游变慢时请求堆叠
@@ -543,17 +545,23 @@ async function loadDetail() {
   if (S.sel.type === 'fund') {
     S.book = null;
     S.bookError = null;
+    S.permission = null; // 场外基金不受板块适当性限制，交由风控 forbidFund 决定
     renderBook();
     return;
   }
   try {
-    const d = await api(`/api/detail?secid=${encodeURIComponent(S.sel.secid)}&type=${S.sel.type}`);
+    const d = await api(
+      `/api/detail?secid=${encodeURIComponent(S.sel.secid)}&code=${encodeURIComponent(S.sel.code)}&type=${S.sel.type}`
+    );
     S.book = d.book;
     S.bookError = d.bookError || null;
+    S.permission = d.permission || null;
     renderBook();
+    applyPermissionHint();
   } catch (e) {
     S.book = null;
     S.bookError = e.message;
+    S.permission = null;
     renderBook();
   }
 }
@@ -561,6 +569,27 @@ async function loadDetail() {
 /* ============ 下单面板 ============ */
 function isFundSel() {
   return S.sel?.type === 'fund';
+}
+
+/**
+ * 账户权限对下单面板的限制。
+ * 只拦买入：卖出永远放行，否则权限收紧后存量持仓无法退出。
+ * @param {string} [baseHint] 默认提示文案，无权限时会被覆盖
+ */
+function applyPermissionHint(baseHint) {
+  if (baseHint !== undefined) S.baseHint = baseHint;
+  const hint = $('#orderHint');
+  const btn = $('#btnSubmit');
+  if (!hint || !btn) return false;
+  const perm = S.permission;
+  const blocked = !!(perm && !perm.allowed) && S.side === 'buy';
+  hint.classList.toggle('warn', blocked);
+  hint.textContent = blocked
+    ? `未开通${perm.label}：需 ${perm.need}。当前账户只能交易沪深主板与场内基金（科创/创业 ETF 除外）`
+    : S.baseHint || '';
+  btn.disabled = S.sel?.type === 'index' || blocked;
+  btn.title = blocked ? `无${perm.label}交易权限` : '';
+  return blocked;
 }
 
 function setSide(side) {
@@ -577,6 +606,7 @@ function setSide(side) {
   $('#inQty').placeholder = isFundSel() ? '赎回份额（可含小数）' : '100 的整数倍';
   $('#inQty').step = isFundSel() ? '0.01' : '100';
   updateEstimate();
+  applyPermissionHint();
 }
 
 function syncOrderMode() {
@@ -606,7 +636,7 @@ function syncOrderMode() {
         ? '100 股起，1 股递增'
         : '100 的整数倍';
   $('#inQty').step = fund ? '0.01' : '1';
-  $('#orderHint').textContent = index
+  const baseHint = index
     ? '指数不可直接交易，请选择个股 / ETF / 基金'
     : fund
       ? '场外基金未知价交易：T 日 15:00 前按当日净值，之后顺延至下一交易日'
@@ -615,8 +645,8 @@ function syncOrderMode() {
         : S.orderType === 'market'
           ? '市价委托：五档即时成交，剩余部分自动撤销'
           : '限价委托：按对手价成交，未成交部分挂单排队，当日有效';
+  applyPermissionHint(baseHint);
   setSide(S.side);
-  $('#btnSubmit').disabled = index;
   renderPriceRange();
 }
 
@@ -778,7 +808,7 @@ async function submitOrder() {
   } catch (e) {
     toast(e.message, 'err');
   } finally {
-    btn.disabled = S.sel?.type === 'index';
+    applyPermissionHint(); // 恢复按钮状态时一并考虑权限（无权限则保持禁用）
   }
 }
 
@@ -976,6 +1006,7 @@ function bindSearch() {
 function selectSymbol(sym) {
   S.sel = { secid: sym.secid, code: sym.code, name: sym.name, type: sym.type };
   S.book = null;
+  S.permission = null; // 切换标的后旧权限状态立即失效，等 loadDetail 返回再判定
   // 场外基金只提供净值曲线，隐藏 K 线切换
   $('#chartTabs').classList.toggle('hidden', sym.type === 'fund');
   renderWatch();

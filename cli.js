@@ -189,6 +189,16 @@ function guardBuy({ cfg, ctx, dash, quote, code, name, type, qty, price, market 
   const isNew = !ctx.positions.some((p) => p.code === code);
   const px = market ? num(quote?.price) : num(price);
 
+  // 账户资质优先：板块都没开通，后面的仓位/价格/数量规则全是空谈
+  const perm = R.permissionOf({ code, name, type, permissions: cfg.account?.permissions });
+  if (!perm.allowed) {
+    throw new Error(
+      `账户无${perm.label}交易权限：需 ${perm.need}。` +
+        `当前模拟账户为「新开户 + 5 万本金 + 无交易经验」，只能交易沪深主板与场内基金` +
+        `（科创板 ETF、创业板 ETF 不受此限）。如确需放开，改 data/autotrade.json 的 account.permissions`
+    );
+  }
+
   // 标的资格检查放在最前：否则基金/ST 会先撞上下面的整手校验，报出误导性的原因
   if (num(risk.forbidST) !== 0 && /ST|退/.test(name || '')) {
     throw new Error(`风控禁止买入 ST / 退市风险股：${name}`);
@@ -267,6 +277,12 @@ async function cmdStatus() {
       `累计 ${signColor(a.totalPnl)}${money(a.totalPnl)} (${pct(a.totalPnlPct)})${C.x}`
   );
 
+  const denied = R.deniedBoards(cfg.account?.permissions);
+  console.log(
+    `${C.b}账户资质${C.x} 可交易 ${R.allowedBoards(cfg.account?.permissions).join('、')}　` +
+      `${C.d}未开通 ${denied.length} 项：${denied.slice(0, 6).map((d) => d.label).join('、')}${denied.length > 6 ? ' 等' : ''}${C.x}`
+  );
+
   if (!ctx.positions.length) {
     console.log(`${C.b}持仓${C.x} 空仓`);
   } else {
@@ -338,12 +354,15 @@ async function cmdScan(argv) {
   const j = await r.json();
   const list = (j?.data?.diff || []).filter((d) => {
     const code = String(d.f12);
+    const name = String(d.f14 || '');
     const price = num(d.f2);
     const p = num(d.f3);
     const amount = num(d.f6);
     if (!/^\d{6}$/.test(code)) return false;
+    // 账户资质：未开通的板块直接出局（科创板/创业板/北交所/ST/退市整理）
+    if (!R.permissionOf({ code, name, type: 'stock', permissions: cfg.account?.permissions }).allowed) return false;
     if ((sc.excludeBoards || []).some((b) => code.startsWith(b))) return false;
-    if (/ST|退|N$|C$/.test(d.f14 || '')) return false;
+    if (/N$|C$/.test(name)) return false; // 新股/次新：上市初期无涨跌幅限制，不在候选池
     if (price < num(sc.minPrice, 3) || price > num(sc.maxPrice, 130)) return false;
     const [lo, hi] = sc.pctRange || [-4, 6];
     if (p < lo || p > hi) return false;
@@ -351,8 +370,9 @@ async function cmdScan(argv) {
     return true;
   });
 
-  console.log(`${C.b}候选池${C.x}（成交额前列，剔除 ST/科创/北交所，价 ${sc.minPrice}–${sc.maxPrice}，涨幅 ${(sc.pctRange || []).join('%~')}%，成交额 ≥${sc.minAmountYi} 亿）`);
-  console.log(`${C.d}价格区间保证：一手 ≤ ${money(num(sc.maxPrice) * 100)}，单手即可满足单笔下限${C.x}`);
+  const boards = R.allowedBoards(cfg.account?.permissions).join('、');
+  console.log(`${C.b}候选池${C.x}（成交额前列，价 ${sc.minPrice}–${sc.maxPrice}，涨幅 ${(sc.pctRange || []).join('%~')}%，成交额 ≥${sc.minAmountYi} 亿）`);
+  console.log(`${C.d}可交易范围：${boards}　｜　价格区间保证一手 ≤ ${money(num(sc.maxPrice) * 100)}${C.x}`);
   list.slice(0, limit).forEach((d, i) => {
     console.log(
       `${String(i + 1).padStart(2)}. ${d.f12} ${String(d.f14).padEnd(6)}　价 ${String(num(d.f2).toFixed(2)).padStart(7)}　` +
