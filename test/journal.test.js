@@ -85,9 +85,10 @@ ok('计划区覆盖写入，保留空行与表格结构', () => {
   J.setSection('plan', '结论\n\n| 批次 | 标的 |\n|---|---|\n| 1 | 512890 |', D);
   J.setSection('plan', '新结论\n\n第二段', D);
   const plan = J.sectionOf(read(D), 'plan');
-  assert.ok(plan.startsWith('新结论'), '应被覆盖');
-  assert.ok(!plan.includes('512890'), '旧内容不应残留');
+  assert.ok(plan.includes('新结论'), '应被覆盖');
+  assert.ok(!plan.includes('512890'), '旧内容不应残留（已归档，不应并置在计划区）');
   assert.ok(plan.includes('\n\n第二段'), '空行必须保留，否则 Markdown 会粘连');
+  assert.ok(plan.indexOf('新结论') < plan.indexOf('第二段'), '顺序不能乱');
 });
 
 ok('复盘区独立于计划区', () => {
@@ -95,8 +96,8 @@ ok('复盘区独立于计划区', () => {
   J.setSection('plan', '计划内容', D);
   J.setSection('review', '复盘内容', D);
   const t = read(D);
-  assert.strictEqual(J.sectionOf(t, 'plan'), '计划内容');
-  assert.strictEqual(J.sectionOf(t, 'review'), '复盘内容');
+  assert.ok(J.sectionOf(t, 'plan').includes('计划内容'));
+  assert.strictEqual(J.sectionOf(t, 'review'), '复盘内容', '复盘区不应被计划头污染');
 });
 
 ok('--append 追加到计划区末尾，不冲掉早盘计划', () => {
@@ -112,8 +113,48 @@ ok('--append 追加到计划区末尾，不冲掉早盘计划', () => {
 ok('append 到空区时不出现多余分隔线', () => {
   clean();
   J.setSection('plan', '唯一内容', D, { append: true });
-  assert.strictEqual(J.sectionOf(read(D), 'plan'), '唯一内容');
+  const plan = J.sectionOf(read(D), 'plan');
+  assert.ok(plan.includes('唯一内容'));
   assert.ok(!read(D).includes('\n---\n'), '不应插入分隔线');
+});
+
+ok('计划区覆盖：旧版归档、时间线留指针、版本递增', () => {
+  clean();
+  J.setSection('plan', '第一版：买 512890 一档', D);
+  assert.strictEqual(J.planVersions(D).length, 0, '首版写入时没有旧版可归档');
+
+  J.setSection('plan', '第二版：改买 600900', D);
+  const files = J.planVersions(D);
+  assert.strictEqual(files.length, 1, '旧版应归档一份');
+  assert.ok(fs.readFileSync(files[0], 'utf8').includes('第一版'), '归档内容应是旧版原文');
+
+  const tl = J.sectionOf(read(D), 'tl');
+  assert.ok(/计划区旧版（v1，\d+ 行）被覆盖/.test(tl), '时间线要留归档指针');
+  assert.ok(tl.includes('plan-archive'), '指针里要有归档路径');
+
+  J.setSection('plan', '第三版：空仓等待', D);
+  assert.strictEqual(J.planVersions(D).length, 2, '第二版也要归档');
+  assert.ok(J.sectionOf(read(D), 'plan').includes('第 3 版'), '版本头应递增到 v3');
+});
+
+ok('计划区版本头标明交易日与写入时点', () => {
+  clean();
+  J.setSection('plan', '内容', D);
+  const plan = J.sectionOf(read(D), 'plan');
+  const head = plan.split('\n')[0];
+  assert.ok(head.startsWith('> 计划区 ｜ 交易日 '), `首行应是版本头，实为：${head}`);
+  assert.ok(head.includes(D), '要标交易日，避免次日读错');
+  assert.ok(/第 1 版/.test(head));
+  assert.ok(/写入 \d{2}:\d{2}/.test(head));
+});
+
+ok('重复覆盖不会把版本头套娃', () => {
+  clean();
+  J.setSection('plan', '内容甲', D);
+  const once = J.sectionOf(read(D), 'plan');
+  J.setSection('plan', once, D); // 把带头的正文再写回去
+  const twice = J.sectionOf(read(D), 'plan');
+  assert.strictEqual((twice.match(/> 计划区 ｜/g) || []).length, 1, '版本头只能有一行');
 });
 
 ok('空内容被拒绝', () => {

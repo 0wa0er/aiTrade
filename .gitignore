@@ -15,6 +15,14 @@ data/bands.state.json
 data/alerts.json
 data/agent-runs/
 
+# ---- 实时盯盘运行时 ----
+# data/live/ 里是进程锁、每轮快照、事件流水和唤醒日志，都是运行态。
+# 计划区归档（data/journal/plan-archive/）是业务记录，要入库，别加进来。
+data/live/
+
+# ---- 账户状态手工备份（含现金与持仓快照，不入库）----
+data/backup/
+
 # ---- WorkBuddy 运行时数据（记忆、自动化快照）----
 .workbuddy/
 

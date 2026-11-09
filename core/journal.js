@@ -18,6 +18,8 @@ const DIR = process.env.TD_JOURNAL_DIR
   ? path.resolve(process.env.TD_JOURNAL_DIR)
   : path.join(ROOT, 'data', 'journal');
 const ARCHIVE = path.join(DIR, 'archive');
+// 计划区每次「覆盖写入」前，旧版正文归档到这里；计划区本体只保留最新一版
+const PLAN_ARCHIVE = path.join(DIR, 'plan-archive');
 
 const TAGS = ['计划', '交易', '风控', '复盘', '运维', '自检', '记录'];
 const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
@@ -80,7 +82,9 @@ function skeleton(key) {
 
 ## 今日计划
 
-> 由 \`node cli.js journal plan\` 覆盖写入。盘前 09:05 一次，盘中允许修正后重写。
+> 由 \`node cli.js journal plan\` 写入。**只写「接下来要做什么」**：持仓处置、候选与触发价、笔数上限、情景闸门、证伪信号。
+> 当日已发生的执行过程写时间线，不要堆进这里——覆盖时旧版自动归档到 \`data/journal/plan-archive/<日期>/\`。
+> 盘前用覆盖式（\`plan\`），盘中修正用 \`plan --append\`。
 
 <!-- PLAN:START -->
 （待写入）
@@ -273,6 +277,54 @@ function appendTimeline({ text, tag = '记录', at, key = dateKey() } = {}) {
   return { file: j.file, migrated: j.migrated, created: j.created };
 }
 
+// ---------------- 计划区版本化 ----------------
+
+/**
+ * 计划区的定位：**只写「接下来要做什么」**。
+ * 当日已经发生的执行过程属于时间线，不属于计划；否则计划区会越长越像流水账，
+ * 次日读计划的人抓不到重点（2026-11-09 的单日计划区膨胀到 240 行就是这个病）。
+ *
+ * 因此覆盖写入时：
+ * 1) 旧版正文整篇归档到 data/journal/plan-archive/<日期>/<HHMM>-vN.md，不丢；
+ * 2) 时间线留一行指针（旧版第几版、多少行、归档在哪、摘要一句）；
+ * 3) 新版自动加一行版本头，标明交易日 / 第几版 / 写入时点。
+ */
+function planDir(key) {
+  return path.join(PLAN_ARCHIVE, key);
+}
+
+/** 该日期已归档的历史版本（按文件名排序，天然按时点排） */
+function planVersions(key) {
+  try {
+    return fs
+      .readdirSync(planDir(key))
+      .filter((f) => /^v\d+.*\.md$/.test(f))
+      .sort()
+      .map((f) => path.join(planDir(key), f));
+  } catch (e) {
+    return [];
+  }
+}
+
+function archivePlan(key, body, version) {
+  const dir = planDir(key);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `v${pad2(version)}-${clock().replace(':', '')}.md`);
+  fs.writeFileSync(file, `${body}\n`, 'utf8');
+  return file;
+}
+
+/** 版本头：一行元信息，让次日读计划时不会把昨天/今天的版本搞混 */
+function planHeader(key, version) {
+  return `> 计划区 ｜ 交易日 ${key} ${weekday(key)} ｜ 第 ${version} 版 ｜ 写入 ${clock()} ｜ 只写「接下来做什么」，过程见时间线`;
+}
+
+function stripPlanHeader(body) {
+  return String(body)
+    .replace(/^>\s*计划区\s*｜[^\n]*\n+/, '')
+    .replace(/^\n+/, '');
+}
+
 /**
  * 覆盖或追加写入 PLAN / REVIEW 区。section ∈ 'plan' | 'review'
  * opts.append=true 时接到现有内容后面（盘中修正、尾盘补明日预案用）。
@@ -281,18 +333,44 @@ function setSection(section, content, key = dateKey(), opts = {}) {
   if (!['plan', 'review'].includes(section)) {
     throw new Error(`未知区块：${section}（只支持 plan / review）`);
   }
-  const body = normalizeBody(content);
+  const body = normalizeBody(section === 'plan' ? stripPlanHeader(content) : content);
   if (!body) throw new Error('内容为空');
   const j = ensureJournal(key);
   let next = body;
+  let archived = null;
+  let version = 0;
+
   if (opts.append) {
     const cur = sectionOf(j.text, section);
     const blank = !cur || !cur.trim() || cur.trim() === '（待写入）';
     if (!blank) next = `${cur.trim()}\n\n---\n\n${body}`;
+    else if (section === 'plan') next = `${planHeader(key, 1)}\n\n${body}`;
+  } else if (section === 'plan') {
+    const cur = sectionOf(j.text, 'plan');
+    const blank = !cur || !cur.trim() || cur.trim() === '（待写入）';
+    const prevCount = planVersions(key).length;
+    version = prevCount + 1;
+    if (!blank) {
+      const cleaned = normalizeBody(stripPlanHeader(cur));
+      const lines = cleaned.split('\n').length;
+      archived = archivePlan(key, cleaned, prevCount + 1);
+      const rel = path.relative(ROOT, archived).replace(/\\/g, '/');
+      const digest = summarize(cleaned, 48).replace(/\n/g, ' ');
+      version = prevCount + 2;
+      const entry = `- \`${clock()}\` **[计划]** 计划区旧版（v${prevCount + 1}，${lines} 行）被覆盖，已归档 \`${rel}\`；摘要：${digest}`;
+      const tlCur = sectionOf(j.text, 'tl');
+      const tlNext = !tlCur || !tlCur.trim() ? entry : insertByTime(tlCur, entry, clock());
+      const temp = replaceSection(j.text, 'tl', tlNext);
+      const out = touchMeta(replaceSection(temp, section, `${planHeader(key, version)}\n\n${body}`), clock());
+      fs.writeFileSync(j.file, out, 'utf8');
+      return { file: j.file, migrated: j.migrated, version, archived };
+    }
+    next = `${planHeader(key, version)}\n\n${body}`;
   }
+
   const out = touchMeta(replaceSection(j.text, section, next), clock());
   fs.writeFileSync(j.file, out, 'utf8');
-  return { file: j.file, migrated: j.migrated };
+  return { file: j.file, migrated: j.migrated, version, archived };
 }
 
 function touchMeta(text, hhmm) {
@@ -451,6 +529,7 @@ function brief(days = 3) {
 module.exports = {
   DIR,
   ARCHIVE,
+  PLAN_ARCHIVE,
   TAGS,
   dateKey,
   clock,
@@ -461,6 +540,8 @@ module.exports = {
   readJournal,
   appendTimeline,
   setSection,
+  planVersions,
+  planDir,
   syncMeta,
   listKeys,
   renderIndex,

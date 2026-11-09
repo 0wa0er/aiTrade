@@ -29,6 +29,17 @@
  *   node cli.js watch rm 600900 [--reason "已证伪"]       手动移出
  *   node cli.js watch prune [--dry-run]                   退役：观察期满 / 已建仓 / 超上限
  *
+ * 实时盯盘（常驻进程，交易时段实时看盘，可互动；只卖不买）：
+ *   node cli.js live status                               运行状态 + 盘面快照 + 风控信号
+ *   node cli.js live on [--interval 20] [--until 14:30] [--auto]   启动（--auto 才自动执行止损止盈）
+ *   node cli.js live off                                  停止
+ *   node cli.js live note "一句话"                         给盯盘进程留言（同步进时间线）
+ *   node cli.js live halt | resume                        暂停告警 / 恢复
+ *
+ * 系统任务（不走 WorkBuddy 调度，由 Windows 任务计划唤醒；agent 未登录时自动降级为规则执行）：
+ *   node tools/wake.js plan|open|midday|tail|close|live-on|live-off [--agent] [--auto]
+ *   powershell -ExecutionPolicy Bypass -File tools/install-tasks.ps1   注册；加 -Uninstall 卸载
+ *
  * 日志（规范见 data/journal/README.md，务必走这里，不要手写文件）：
  *   node cli.js note [--tag 交易] "内容"   追加一条时间线记录（标签：计划/交易/风控/复盘/运维/自检/记录）
  *   node cli.js journal plan  "..."        覆盖写入「今日计划」区（加 --append 追加；可 --file 或用管道）
@@ -559,10 +570,19 @@ async function cmdJournal(rest, argv = {}) {
       const body = readContent(restArgs, argv);
       const append = argv.append === 'true' || argv.append === true;
       const r = J.setSection(sub, body, key, { append });
-      console.log(
-        `${C.g}✓${C.x} ${sub === 'plan' ? '今日计划' : '收盘复盘'}已${append ? '追加' : '写入'} ${path.relative(ROOT, r.file)}`
-      );
+      const name = sub === 'plan' ? '今日计划' : '收盘复盘';
+      const vTag = r.version ? `（第 ${r.version} 版）` : '';
+      console.log(`${C.g}✓${C.x} ${name}已${append ? '追加' : '写入'}${vTag} ${path.relative(ROOT, r.file)}`);
+      if (r.archived) console.log(`${C.d}  旧版已归档 ${path.relative(ROOT, r.archived)}${C.x}`);
       if (r.migrated) console.log(`${C.d}  旧格式已迁移${C.x}`);
+      if (sub === 'plan' && !append) {
+        const lines = String(body).split('\n').length;
+        if (lines > 120) {
+          console.log(
+            `${C.y}  ! 计划区 ${lines} 行，偏胖。计划只写「接下来做什么」，当日执行过程请进时间线（note）${C.x}`
+          );
+        }
+      }
       return;
     }
     case 'sync': {
@@ -980,6 +1000,145 @@ async function cmdWatch(rest, argv) {
   throw new Error('用法：node cli.js watch list | add <代码> --note "..." [--source plan] [--ttl 5] | rm <代码> | prune [--dry-run]');
 }
 
+// ---------------- 实时盯盘 ----------------
+/**
+ * 与常驻盯盘进程（tools/live.js）互动。
+ * 盯盘进程只负责「看」和「卖出」，不负责买入——买入要判断，留在 09:45 / 14:40 的窗口。
+ */
+const hhmmOf = (iso) => {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '--:--';
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+};
+
+async function cmdLive(rest, argv = {}) {
+  const sub = rest[0] || 'status';
+  const LPORT = Number(process.env.TD_LIVE_PORT || 5194);
+  const LBASE = `http://127.0.0.1:${LPORT}`;
+  const LIVE_PID = path.join(ROOT, 'data', 'live', 'live.pid');
+
+  const getState = async () => {
+    try {
+      const r = await fetch(`${LBASE}/state`, { signal: AbortSignal.timeout(3000) });
+      const j = await r.json();
+      return j.ok ? j.data : null;
+    } catch (e) {
+      return null;
+    }
+  };
+  const post = async (body) => {
+    const r = await fetch(`${LBASE}/cmd`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+    return r.json();
+  };
+
+  if (sub === 'status' || sub === 'st') {
+    const s = await getState();
+    if (!s) {
+      console.log(`${C.d}盯盘未启动。${C.x}启动：node cli.js live on [--interval 20] [--auto]`);
+      return;
+    }
+    const up = Math.round((Date.now() - new Date(s.startAt).getTime()) / 60000);
+    console.log(
+      `${C.g}盯盘运行中${C.x} PID ${s.pid}　已跑 ${up} 分钟　${s.ticks} 轮　${s.interval}s/轮　` +
+        `${s.until} 收工　${s.auto ? `${C.y}自动执行卖出${C.x}` : '仅告警'}`
+    );
+    if (s.halted) console.log(`${C.y}已暂停：${s.haltedReason || '手动'}${C.x}`);
+    const L = require('./core/live');
+    console.log(`快照：${L.snapshotLine(s.snapshot) || '（尚无数据）'}`);
+    if (s.snapshot && s.snapshot.fired && s.snapshot.fired.length) {
+      console.log(`区间：${s.snapshot.fired.join('、')}`);
+    }
+    const sig = (s.snapshot && s.snapshot.signals) || [];
+    if (sig.length) {
+      for (const x of sig) console.log(`${x.severity === 'critical' ? C.r : C.y}!${C.x} ${x.text}`);
+    } else {
+      console.log(`${C.d}风控信号：无${C.x}`);
+    }
+    const ev = (s.events || []).slice(-5);
+    if (ev.length) {
+      console.log(`${C.d}最近事件：${C.x}`);
+      for (const e of ev) console.log(`  ${C.d}${hhmmOf(e.at)}${C.x} ${e.type} ${e.text}`);
+    }
+    if ((s.notes || []).length) {
+      console.log(`${C.d}你留的话：${C.x}${s.notes.slice(-3).map((n) => n.at + ' ' + n.text).join(' ｜ ')}`);
+    }
+    return;
+  }
+
+  if (sub === 'on') {
+    const cur = await getState();
+    if (cur) {
+      console.log(`${C.y}已在运行（PID ${cur.pid}）${C.x}，先 node cli.js live off 再重启`);
+      return;
+    }
+    const args = [path.join(ROOT, 'tools', 'live.js')];
+    if (argv.interval && argv.interval !== true) args.push('--interval', String(argv.interval));
+    if (argv.until && argv.until !== true) args.push('--until', String(argv.until));
+    if (argv.auto === 'true' || argv.auto === true) args.push('--auto');
+    if (argv.force === 'true' || argv.force === true) args.push('--force');
+    const child = spawn(process.execPath, args, {
+      cwd: ROOT,
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, NO_OPEN: '1' },
+    });
+    child.unref();
+    await new Promise((r) => setTimeout(r, 2500));
+    const s = await getState();
+    if (s) console.log(`${C.g}✓${C.x} 盯盘已启动 PID ${s.pid}　${s.interval}s/轮　${s.until} 收工`);
+    else console.log(`${C.y}进程已拉起（PID ${child.pid}），但接口未就绪。可能是时段不对（非交易时段默认不启动），加 --force 可调试${C.x}`);
+    return;
+  }
+
+  if (sub === 'off') {
+    const s = await getState();
+    let pid = s && s.pid;
+    if (!pid && fs.existsSync(LIVE_PID)) pid = Number(fs.readFileSync(LIVE_PID, 'utf8'));
+    if (!pid) {
+      console.log(`${C.d}没有在跑的盯盘进程${C.x}`);
+      return;
+    }
+    try {
+      process.kill(pid, 'SIGTERM');
+      console.log(`${C.g}✓${C.x} 已停止盯盘 PID ${pid}`);
+    } catch (e) {
+      if (e.code === 'ESRCH') {
+        // 进程早已不在，清掉残留锁，否则下次 live on 会误判「已在运行」
+        try {
+          fs.unlinkSync(LIVE_PID);
+        } catch (e2) {}
+        console.log(`${C.d}盯盘进程已不在（PID ${pid} 已退出），残留锁已清理${C.x}`);
+      } else {
+        console.log(`${C.y}停止失败：${e.message}${C.x}`);
+      }
+    }
+    return;
+  }
+
+  if (sub === 'note' || sub === 'ask') {
+    const text = rest.slice(1).join(' ').trim();
+    if (!text) throw new Error('用法：node cli.js live note "给盯盘进程留一句话"');
+    const r = await post({ action: 'note', text });
+    if (!r.ok) throw new Error(r.msg || '盯盘进程未响应');
+    console.log(`${C.g}✓${C.x} 已记入盯盘与时间线：${text}`);
+    return;
+  }
+
+  if (sub === 'halt' || sub === 'resume') {
+    const r = await post({ action: sub, text: rest.slice(1).join(' ') });
+    if (!r.ok) throw new Error(r.msg || '盯盘进程未响应');
+    console.log(`${C.g}✓${C.x} ${sub === 'halt' ? '已暂停盯盘（不再告警）' : '已恢复盯盘'}`);
+    return;
+  }
+
+  throw new Error('用法：node cli.js live status|on|off|note "..."|halt|resume');
+}
+
 // ---------------- 告警队列 ----------------
 async function cmdAlert(rest, argv) {
   const sub = rest[0] || 'poll';
@@ -1068,6 +1227,7 @@ async function main() {
       case 'risk': await cmdRisk(); break;
       case 'band': await cmdBand(rest, argv); break;
       case 'watch': await cmdWatch(rest, argv); break;
+      case 'live': await cmdLive(rest, argv); break;
       case 'alert': await cmdAlert(rest, argv); break;
       case 'scan': await cmdScan(argv); break;
       case 'quote':

@@ -76,6 +76,10 @@ node cli.js status                   # ③ 账户、时段、持仓、挂单、�
 | `core/journal.js` | 日志引擎（锚点、插入、索引） | 同上 |
 | `core/bands.js` | 区间判定 + 告警队列 + 二次分析进程拉起 | 改后必须跑 `npm test` |
 | `core/watch.js` | 自选股生命周期（进场闸门 / 到期退役） | 改后必须跑 `npm test` |
+| `core/live.js` | 实时盯盘的判定纯函数（止损/止盈/结构、去抖、快照摘要） | 改后必须跑 `npm test` |
+| `tools/live.js` | **常驻盯盘进程**（交易时段实时看盘，本地 HTTP 可互动） | 改后手动 `live on --force` 自检 |
+| `tools/wake.js` | **系统唤醒入口**（任务计划调它；agent 未登录时降级为规则执行） | 改后 `wake.js <task>` 单跑一遍 |
+| `tools/install-tasks.ps1` | 注册 / 卸载系统计划任务 | 动系统配置，改前先 `-List` |
 | `cli.js` | 命令行 + **风控闸门** | 改后必须跑 `npm test` |
 | `public/` | 前端（app.js / index.html / style.css） | 截图自检 |
 | `data/autotrade.json` | 风控红线 + **账户资质（`account.permissions`）** | 仅在用户明确要求时；改完即时生效 |
@@ -85,7 +89,8 @@ node cli.js status                   # ③ 账户、时段、持仓、挂单、�
 | `data/fees.json` | 券商费率（费用改这里） | 重启生效 |
 | `data/journal/` | **业务日志**（每日一篇，规范见其 README） | 只通过 cli 写 |
 | `data/state.json` | 账户状态（程序写，别手改；`watchlist` 带生命周期字段） | 否 |
-| `test/` | `trading` / `cli` / `journal` / `bands` / `watch` 五套 | 随改动同步 |
+| `data/journal/plan-archive/` | 计划区历史版本（覆盖时自动归档） | 只读，别手改 |
+| `test/` | `trading` / `cli` / `journal` / `bands` / `watch` / `live` 六套 | 随改动同步 |
 
 ## 5. 命令速查
 
@@ -206,6 +211,56 @@ TD_FORCE_SESSION=1 node server.js      # 收盘后调试区间监控用（忽略
 **谁在动它**：08:45 盘前计划写完后 `prune` + 把候选同步进池（`--source plan --ttl 5`）；15:15 收盘复盘 `watch list` 检视 + `rm` 掉证伪的 + `prune` 收尾。09:45 / 11:25 / 14:40 **只读不动**（`watch list` 可选），避免每天多出无关写入。
 
 **别做的事**：不要为了「留档」给到期票续期（逻辑还成立才续）；不要用 `watch add` 堆一屏长期票（那是把观察池当收藏夹）；不要在任务里自动建区间——区间是穿越触发，给观察票乱建会天天制造噪声告警。
+
+## 11. 调度：走系统任务，不走 WorkBuddy
+
+**为什么换**：WorkBuddy 的定时任务触发有数分钟延迟（2026-11-09 实测：设 09:05，计划 09:22 才落地），而开盘窗口只有几分钟。系统任务计划按秒级触发，不依赖宿主进程存活。
+
+**七个任务**（周一到周五触发；节假日由 `wake.js` 读 `data/holidays.json` 自行跳过，任务计划做不了这件事）：
+
+| 时点 | 任务 | 干什么 |
+|---|---|---|
+| 08:45 | `wake.js plan` | 参数卡（现取 MA/BOLL/额度）+ 观察池 prune，**不交易** |
+| 09:20 | `wake.js live-on` | 拉起常驻盯盘进程 |
+| 09:45 | `wake.js open` | 开盘窗口：告警消费 + 风控 + 建仓 |
+| 11:25 | `wake.js midday` | 午间检视，只卖不买 |
+| 14:40 | `wake.js tail` | 尾盘调仓 |
+| 15:05 | `wake.js live-off` | 停盯盘 |
+| 15:15 | `wake.js close` | 快照 / 观察池 / 索引归档，**不交易** |
+
+注册（注册到当前用户，不需要管理员）：
+
+```bat
+:: 主入口，-List 查看、-Uninstall 撤回、-WithAgent 走 CLI、-AutoSell 允许自动止损止盈
+tools\install-tasks.ps1
+```
+
+**降级是刻意的**：`wake.js` 先试 agent（`--agent`），CLI 未登录就退回确定性路径——取数、写参数卡、跑风控、消费告警。**不会因为模型没响应就什么都不做**。代价是它不做主观判断，所以参数卡里明写「待补主观判断」，别把它当成品计划。
+
+## 12. 实时盯盘（常驻）
+
+```bash
+node cli.js live status              # 快照 + 风控信号 + 最近事件
+node cli.js live on --interval 15    # 启动（默认 20s 一轮，15:05 自停）
+node cli.js live note "一句话"        # 留言，同步进时间线
+node cli.js live halt | resume       # 暂停告警 / 恢复
+node cli.js live off
+```
+
+- **只卖不买**：算止损/止盈/结构信号，命中可调 `cli.js sell`；买入要判断，留给 09:45 / 14:40。
+- **默认只告警**：`--auto` 才真下单。宁可漏一次自动止损，也不让没有判断力的进程乱卖。
+- 互动接口在 `127.0.0.1:5194`（`GET /state`、`POST /cmd`），只绑回环。
+- 盯盘进程挂了不影响定时任务：`wake.js` 每条命令自带 `ensureServer()`，状态全落盘。
+
+## 13. 计划区的写法（v2.5 起）
+
+计划区**只写「接下来做什么」**，当日执行过程进时间线。覆盖写入时：
+
+1. 旧版整篇归档到 `data/journal/plan-archive/<日期>/vN-HHMM.md`；
+2. 时间线留一行指针（第几版、多少行、归档路径、摘要）；
+3. 新版自动加版本头：`> 计划区 ｜ 交易日 … ｜ 第 N 版 ｜ 写入 HH:MM`。
+
+所以盘中用覆盖式也不会丢对照链了，但**仍然该用 `--append`**——归档是兜底，不是许可证。
 
 ---
 
