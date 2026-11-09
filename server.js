@@ -1763,7 +1763,7 @@ function runBandAgent(cfg, band, alert) {
   BAND_LIVE.agentRunning = true;
   let child;
   try {
-    child = spawn(plan.entry.cmd, plan.entry.args, {
+    child = spawn(plan.entry.cmd, plan.args, {
       cwd: ROOT,
       stdio: ['ignore', out, out],
       windowsHide: true,
