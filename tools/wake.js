@@ -342,6 +342,14 @@ function tLiveOff() {
     }
 
     const steps = (() => {
+      // 条件单兜底：可委托时段的唤醒先补一次判定，盯盘进程没起来也不至于漏单。
+      // 判定、执行、状态机都在 cli.js cond check，这里只负责叫它并留痕。
+      if (def.needTradable) {
+        const c = cli(['cond', 'check']);
+        if (c.out && c.out !== 'IDLE' && !c.out.startsWith('HOLIDAY')) {
+          logLine(`条件单：${c.out.replace(/\n+/g, ' ｜ ')}`);
+        }
+      }
       switch (task) {
         case 'plan':
           return tPlan();

@@ -45,7 +45,14 @@ function Test-Admin {
 
 if (-not (Test-Path $Bat)) { throw "找不到 run-task.bat：$Bat" }
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'PATH 里找不到 node，先确认已安装 Node.js' }
-$Node = (Get-Command node).Source
+# 选 node：优先系统级安装，避开随宿主应用升级而变动的内置解释器
+$Candidates = @(
+  "$env:ProgramFiles\nodejs\node.exe",
+  "$env:LOCALAPPDATA\Programs\nodejs\node.exe",
+  (Get-Command node).Source
+)
+$Node = $Candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $Node) { throw '找不到 node.exe' }
 
 if ($List) {
   Get-ScheduledTask -TaskName "$Prefix*" -ErrorAction SilentlyContinue |

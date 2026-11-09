@@ -5,6 +5,7 @@
 ## 第 0 步
 1. `node cli.js status` → 休市/不可委托：终端一行说明，**不写日志**，结束。
 2. `node cli.js alert poll --check` → `PENDING` 逐条处理：`quote` 核对 → 判突破还是噪声 → 处置 → `alert ack <id> --note "结论"`。
+3. `node cli.js cond check` → 条件单到点/到价会在这里执行。逐条核对结果：`已执行` 记进时间线；`执行被拦` 要读懂原因（额度不足？超单票上限？无持仓？），再决定是改计划还是留到明天。随后 `node cli.js cond list` 看今日还有哪些单待触发。
 
 ## 第 1 步 · 读计划
 `node cli.js journal show` 读「今日计划」。无计划则用 `journal brief --days 2` 取上一交易日。

@@ -29,6 +29,15 @@
  *   node cli.js watch rm 600900 [--reason "已证伪"]       手动移出
  *   node cli.js watch prune [--dry-run]                   退役：观察期满 / 已建仓 / 超上限
  *
+ * 条件单（到价 / 到点自动委托，触发后仍过风控闸门）：
+ *   node cli.js cond list                                 清单：现价 / 条件 / 等待原因 / 状态
+ *   node cli.js cond add 512890 --side buy --qty 8000 --price 1.205 --op ">=" --note "回踩下轨"
+ *   node cli.js cond add 512890 --side sell --at 14:50 --note "尾盘不恋战"
+ *   node cli.js cond add ... [--mode all|any] [--limit 1.21] [--from 09:30] [--to 14:57] [--expire 2026-11-16]
+ *   node cli.js cond check                                判定并执行（盯盘进程每轮自动调用；无则输出 IDLE）
+ *   node cli.js cond rm C01 | off C01 | on C01            删除 / 撤销 / 恢复
+ *   node cli.js cond prune                                清理已终结记录
+ *
  * 实时盯盘（常驻进程，交易时段实时看盘，可互动；只卖不买）：
  *   node cli.js live status                               运行状态 + 盘面快照 + 风控信号
  *   node cli.js live on [--interval 20] [--until 14:30] [--auto]   启动（--auto 才自动执行止损止盈）
@@ -59,6 +68,7 @@ const R = require('./core/rules');
 const J = require('./core/journal');
 const B = require('./core/bands');
 const W = require('./core/watch');
+const K = require('./core/cond');
 
 const ROOT = __dirname;
 const DATA = path.join(ROOT, 'data');
@@ -1059,6 +1069,11 @@ async function cmdLive(rest, argv = {}) {
     } else {
       console.log(`${C.d}风控信号：无${C.x}`);
     }
+    // 条件单：盯盘进程每轮会叫一次 cond check，这里只报摘要
+    const condSnap = s.snapshot && s.snapshot.cond;
+    if (condSnap && condSnap.active) {
+      console.log(`${C.d}条件单：${condSnap.active} 张待触发${condSnap.lastOut ? ` · 本轮 ${condSnap.lastOut.split('\n')[0]}` : ''}${C.x}`);
+    }
     const ev = (s.events || []).slice(-5);
     if (ev.length) {
       console.log(`${C.d}最近事件：${C.x}`);
@@ -1198,6 +1213,226 @@ async function cmdAlert(rest, argv) {
   throw new Error('用法：node cli.js alert poll|list|ack');
 }
 
+// ---------------- 条件单 ----------------
+
+/**
+ * 条件单：到价 / 到点自动委托。
+ * 与区间（band）分工：band 只叫醒、落告警；cond 是真下单，但仍走 placeOrder 的风控闸门。
+ */
+async function cmdCond(rest, argv = {}) {
+  const sub = rest[0] || 'list';
+  const nowHHMM = () => hhmmOf(new Date().toISOString());
+  const pick = (k, dflt) => (argv[k] != null && argv[k] !== 'true' ? argv[k] : dflt);
+
+  if (sub === 'list') {
+    const db = K.load();
+    if (!db.items.length) {
+      console.log('还没有条件单。示例：');
+      console.log('  node cli.js cond add 512890 --side buy --qty 8000 --price 1.205 --op ">=" --note "回踩下轨"');
+      console.log('  node cli.js cond add 512890 --side sell --at 14:50 --note "尾盘不恋战"');
+      return;
+    }
+    const codes = [...new Set(db.items.filter((x) => x.status === 'active').map((x) => x.code))];
+    const px = new Map();
+    if (codes.length) {
+      try {
+        const q = await api('/api/quotes?secids=' + codes.map(secidOf).join(','));
+        for (const row of q || []) px.set(String(row.code), num(row.price));
+      } catch {
+        /* 服务没起就只显示规则 */
+      }
+    }
+    const hhmm = nowHHMM();
+    const today = R.fmtDate(new Date());
+    console.log(`${padW('ID', 4)} ${padW('标的', 18)} ${padW('现价', 8)} 条件 · 状态`);
+    for (const it of db.items) {
+      const p = px.get(it.code);
+      const ev = it.status === 'active' ? K.evaluate(it, { hhmm, price: p || 0, today }) : null;
+      const tag =
+        it.status === 'active'
+          ? ev && ev.fire
+            ? `${C.y}条件已满足${C.x}`
+            : `${C.g}待触发${C.x}`
+          : it.status === 'fired'
+            ? `${C.d}已执行${C.x}`
+            : it.status === 'error'
+              ? `${C.r}失败待人工${C.x}`
+              : `${C.d}${it.status}${C.x}`;
+      console.log(
+        `${padW(it.id, 4)} ${padW(`${it.name}(${it.code})`, 18)} ${padW(p == null ? '—' : p.toFixed(3), 8)} ${K.describe(it)}`
+      );
+      const extra = [];
+      if (ev && !ev.fire) extra.push(`等待：${ev.why}`);
+      if (it.status === 'fired') extra.push(`已于 ${hhmmOf(it.firedAt)} 触发 @ ${it.firePrice}`);
+      if (it.lastError) extra.push(`错误：${it.lastError}`);
+      if (it.note) extra.push(`理由：${it.note}`);
+      console.log(`${' '.repeat(5)}${tag}${extra.length ? ' · ' + extra.join(' · ') : ''}`);
+    }
+    return;
+  }
+
+  if (sub === 'add') {
+    const code = rest[1] || pick('code', '');
+    if (!/^\d{6}$/.test(code || '')) {
+      throw new Error(
+        '用法：node cli.js cond add 512890 --side buy --qty 8000 [--at 09:45] [--price 1.205 --op ">="] ' +
+          '[--mode all] [--limit 1.21] [--from 09:30] [--to 14:57] [--expire 2026-11-16] --note "理由"'
+      );
+    }
+    let name = pick('name', '');
+    if (!name) {
+      try {
+        const q = await api('/api/quotes?secids=' + secidOf(code));
+        if (q && q[0]) name = q[0].name || '';
+      } catch {
+        /* 服务没起也能建，只是名称留空 */
+      }
+    }
+    const item = K.add(
+      {
+        code,
+        name: name || code,
+        side: pick('side', 'buy'),
+        qty: pick('qty', null),
+        at: pick('at', ''),
+        price: pick('price', null),
+        op: pick('op', '>='),
+        mode: pick('mode', 'all'),
+        orderType: pick('limit', null) != null ? 'limit' : 'market',
+        limitPrice: pick('limit', null),
+        window: { from: pick('from', '09:30'), to: pick('to', '14:57') },
+        expireOn: pick('expire', ''),
+        note: pick('note', ''),
+        source: argv.agent ? 'agent' : 'manual',
+      },
+      { holidays: holidays() }
+    );
+    console.log(`${C.g}✓${C.x} 条件单已建 ${item.id} ${item.name}(${item.code}) ${K.describe(item)}`);
+    console.log(`${' '.repeat(5)}${C.d}理由：${item.note}${C.x}`);
+    console.log(
+      `${' '.repeat(5)}${C.d}触发后由盯盘进程（tools/live.js）或 node cli.js cond check 执行，仍过风控闸门${C.x}`
+    );
+    return;
+  }
+
+  if (sub === 'rm' || sub === 'del') {
+    if (!rest[1]) throw new Error('用法：node cli.js cond rm C01');
+    const it = K.remove(rest[1]);
+    console.log(`${C.g}✓${C.x} 已删除 ${it.id} ${it.name}(${it.code})`);
+    return;
+  }
+
+  if (sub === 'off' || sub === 'on') {
+    if (!rest[1]) throw new Error(`用法：node cli.js cond ${sub} C01`);
+    const it = K.setStatus(rest[1], sub === 'on' ? 'active' : 'cancelled', { lastError: '' });
+    console.log(`${C.g}✓${C.x} ${it.id} 已${it.status === 'active' ? '恢复待触发' : '撤销'}`);
+    return;
+  }
+
+  if (sub === 'prune') {
+    const n = K.prune();
+    console.log(n ? `已清理 ${n} 条终结记录` : '没有可清理的条目');
+    return;
+  }
+
+  if (sub === 'check') {
+    await ensureServer();
+    const db = K.load();
+    const active = db.items.filter((x) => x.status === 'active');
+    if (!active.length) {
+      console.log('IDLE');
+      return;
+    }
+    const dash = await api('/api/dashboard');
+    const sess = dash.meta.session || {};
+    if (sess.code === 'holiday') {
+      console.log(`HOLIDAY ${active.length} 条待触发，休市日不判定`);
+      return;
+    }
+    const today = R.fmtDate(new Date());
+    const hhmm = nowHHMM();
+
+    const codes = [...new Set(active.map((x) => x.code))];
+    const px = new Map();
+    try {
+      const q = await api('/api/quotes?secids=' + codes.map(secidOf).join(','));
+      for (const row of q || []) px.set(String(row.code), num(row.price));
+    } catch (e) {
+      throw new Error(`取价失败，本轮不判定（避免用 0 价误触发）：${e.message}`);
+    }
+
+    const lines = [];
+    for (const item of active) {
+      const price = px.get(item.code) || 0;
+      const ev = K.evaluate(item, { hhmm, price, today });
+
+      if (ev.mark) {
+        K.setStatus(item.id, ev.mark);
+        lines.push(`${item.id} ${ev.why}，已置失效`);
+        continue;
+      }
+      if (!ev.fire) continue;
+
+      if (!sess.accept && !argv.force) {
+        lines.push(`${item.id} 条件满足但当前不可委托（${sess.label}），顺延至下一轮`);
+        continue;
+      }
+
+      // 卖出且没写数量 = 全部可卖
+      let qty = item.qty;
+      if (qty == null) {
+        const pos = (dash.positions || []).find((p) => p.code === item.code);
+        qty = num(pos && pos.available);
+        if (!(qty > 0)) {
+          const f = K.recordFailure(item, '无可用持仓，无法执行卖出');
+          K.setStatus(item.id, f.status, { attempts: f.attempts, lastError: f.lastError });
+          lines.push(`${item.id} 卖出失败：无可用持仓（第 ${f.attempts} 次）`);
+          continue;
+        }
+      }
+
+      const orderArgv = item.orderType === 'limit' ? { price: String(item.limitPrice) } : {};
+      // --dry-run：只过风控预检，不下单也不改状态，用于盘中核对「这张单真触发会怎样」
+      const dry = argv['dry-run'] != null;
+      if (dry) orderArgv['dry-run'] = 'true';
+      try {
+        await placeOrder(item.side, item.code, qty, orderArgv);
+        if (dry) {
+          lines.push(`${item.id} 预演通过：${item.side === 'buy' ? '买' : '卖'} ${qty}股 @ ${price}（未下单，状态不变）`);
+          continue;
+        }
+        K.setStatus(item.id, 'fired', {
+          firedAt: new Date().toISOString(),
+          firePrice: price,
+          attempts: num(item.attempts),
+        });
+        lines.push(`${item.id} 已执行：${item.side === 'buy' ? '买' : '卖'} ${qty}股 @ ${price}`);
+        J.appendTimeline({
+          tag: '交易',
+          text: `[条件单·自动] ${item.id} ${item.name}(${item.code}) 触发（${item.side === 'buy' ? '买' : '卖'} ${qty}股 @ ${price}）：${item.note}`,
+        });
+      } catch (e) {
+        const f = K.recordFailure(item, e.message);
+        K.setStatus(item.id, f.status, { attempts: f.attempts, lastError: f.lastError });
+        lines.push(
+          `${item.id} 执行被拦（第 ${f.attempts}/${K.MAX_ATTEMPTS} 次）：${e.message}` +
+            (f.status === 'error' ? '，已停止重试待人工' : '')
+        );
+        J.appendTimeline({
+          tag: '风控',
+          text: `[条件单] ${item.id} ${item.name}(${item.code}) 触发但执行失败：${e.message.slice(0, 120)}`,
+        });
+      }
+    }
+
+    if (!lines.length) console.log('IDLE');
+    else lines.forEach((l) => console.log(l));
+    return;
+  }
+
+  throw new Error('用法：node cli.js cond list|add|rm|on|off|check|prune');
+}
+
 // ---------------- 入口 ----------------
 function parseArgs(argv) {
   const out = { _: [] };
@@ -1219,13 +1454,17 @@ async function main() {
     // note / journal 是纯文件操作，不能因服务没起就写不进日志；只有 journal sync 需要服务
     // note / alert / band（除 status 外）都是纯文件操作，不能因服务没起就写不进去
     const fileOnly =
-      cmd === 'note' || cmd === 'alert' || (cmd === 'band' && rest[0] !== 'status');
+      cmd === 'note' ||
+      cmd === 'alert' ||
+      cmd === 'cond' ||
+      (cmd === 'band' && rest[0] !== 'status');
     const needServer = cmd && !fileOnly && !(cmd === 'journal' && rest[0] !== 'sync');
     if (needServer) await ensureServer();
     switch (cmd) {
       case 'status': await cmdStatus(); break;
       case 'risk': await cmdRisk(); break;
       case 'band': await cmdBand(rest, argv); break;
+      case 'cond': await cmdCond(rest, argv); break;
       case 'watch': await cmdWatch(rest, argv); break;
       case 'live': await cmdLive(rest, argv); break;
       case 'alert': await cmdAlert(rest, argv); break;

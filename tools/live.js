@@ -3,12 +3,13 @@
  * 实时盯盘守护（常驻进程）
  *
  * 为什么单独存在：定时任务是「到点唤醒、做完即走」，两次唤醒之间的分钟级穿越没人看。
- * 这个进程在交易时段常驻，负责三件事：
+ * 这个进程在交易时段常驻，负责四件事：
  *   1) 区间穿越：驱动服务端补一次判定，把触发落成告警 + 时间线；
  *   2) 持仓风控：止损 / 止盈 / 弱于大盘，实时算，命中即调用 cli.js sell（--auto 才执行，默认只告警）；
- *   3) 可互动：本地 HTTP 接口，能查当前快照、能让它记一句话、能暂停/恢复。
+ *   3) 条件单：把 data/cond.json 里到价 / 到点的单子交给 cli.js cond check 执行（风控闸门在 cli 里）；
+ *   4) 可互动：本地 HTTP 接口，能查当前快照、能让它记一句话、能暂停/恢复。
  *
- * 不负责买入。买入需要判断，属于 09:45 / 14:40 的唤醒任务或人工。
+ * 不负责「决定买什么」。条件单是事先写好的意图，这里只负责到点执行。
  *
  * 用法：
  *   node tools/live.js                     默认 20s 一轮，交易时段工作，15:05 自停
@@ -16,6 +17,9 @@
  *   node tools/live.js --until 14:30       到点自停
  *   node tools/live.js --auto              命中止损/止盈时真的下单（默认只写告警）
  *   node tools/live.js --force             忽略时段限制（收盘后调试用）
+ *
+ * 注意：条件单（data/cond.json）不受 --auto 约束——那是事先写死的明确指令，
+ * 触发即执行；要停某张单用 `node cli.js cond off C01`，要全停就在盯盘进程里 halt。
  */
 const http = require('http');
 const fs = require('fs');
@@ -114,6 +118,42 @@ function cliSell(code, qty) {
   });
 }
 
+/**
+ * 条件单：交给 cli.js cond check 统一判定 + 执行。
+ * 为什么不在这里自己判：判定、执行、状态机、风控只在 cli 那一份，避免两份逻辑漂移。
+ * 没条件单时本地先看一眼就跳过，不为空列表白起进程。
+ */
+function cliCondCheck() {
+  const K = require('../core/cond');
+  let active = [];
+  try {
+    active = K.load().items.filter((x) => x.status === 'active');
+  } catch (e) {
+    return Promise.resolve({ ok: true, out: 'IDLE' });
+  }
+  if (!active.length) return Promise.resolve({ ok: true, out: 'IDLE', count: 0 });
+
+  return new Promise((resolve) => {
+    const p = spawn(process.execPath, [path.join(ROOT, 'cli.js'), 'cond', 'check'], {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (out += d));
+    // 条件单里可能连着下单，给足时间；卡死不留孤儿进程
+    const timer = setTimeout(() => {
+      try {
+        p.kill();
+      } catch (e) {}
+    }, 60000);
+    p.on('close', (code2) => {
+      clearTimeout(timer);
+      resolve({ ok: code2 === 0, out: out.trim().slice(-600), count: active.length });
+    });
+  });
+}
+
 async function breadth() {
   // 涨跌分布只有 westock 有；每 5 分钟取一次，避免每轮 spawn
   const cache = S.snapshot.breadth;
@@ -202,6 +242,13 @@ async function tick() {
   const signals = L.riskSignals(positions, { risk: RISK, benchPct, dayHigh: S.dayHigh });
   const b = await breadth();
 
+  // 条件单：到价 / 到点自动委托。判定、执行、状态机全在 cli.js，这里只负责按时叫它。
+  const cond = await cliCondCheck();
+  if (cond.out && cond.out !== 'IDLE' && !cond.out.startsWith('HOLIDAY')) {
+    // 时间线已由 cli.js cond check 写入，这里只留一条事件，不重复记
+    event('cond', cond.out.replace(/\n+/g, ' ｜ ').slice(0, 400), { active: cond.count || 0 });
+  }
+
   S.snapshot = {
     ts: new Date().toISOString(),
     session: sess.label || '',
@@ -213,6 +260,7 @@ async function tick() {
     equity: dash.account?.totalAsset ?? null,
     cash: dash.account?.totalCash ?? null,
     signals,
+    cond: { active: cond.count || 0, lastOut: cond.out && cond.out !== 'IDLE' ? cond.out.slice(0, 200) : '' },
     fired: fired.map((f) => `${f.name}(${f.code}) ${f.side === 'upper' ? '上破' : '下破'} ${f.price}`),
   };
 
@@ -364,7 +412,17 @@ async function loop() {
   }
 
   serve();
-  event('start', `盯盘上线：${INTERVAL / 1000}s 一轮，${UNTIL} 收工，${AUTO ? '自动执行卖出' : '仅告警'}`);
+  let activeCond = 0;
+  try {
+    activeCond = require('../core/cond').load().items.filter((x) => x.status === 'active').length;
+  } catch (e) {
+    /* 条件单文件损坏不影响盯盘主流程 */
+  }
+  event(
+    'start',
+    `盯盘上线：${INTERVAL / 1000}s 一轮，${UNTIL} 收工，${AUTO ? '自动执行卖出' : '仅告警'}` +
+      (activeCond ? `，${activeCond} 张条件单待触发` : '')
+  );
   J.appendTimeline({ tag: '运维', text: `[盯盘] 实时盯盘上线（PID ${process.pid}，${INTERVAL / 1000}s 一轮，${UNTIL} 收工，${AUTO ? '止盈止损自动执行' : '仅告警'}）` });
 
   const bye = () => {

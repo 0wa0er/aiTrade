@@ -124,8 +124,17 @@ node cli.js watch add 600900 --note "回踩 MA20 等买点" --source plan --ttl 
 node cli.js watch rm 600900 --reason "跌破支撑，证伪"
 node cli.js watch prune [--dry-run]       # 退役：观察期满 / 已建仓 / 超上限
 
+# 条件单（到价 / 到点自动委托，触发后仍过风控闸门）
+node cli.js cond list                    # 现价 / 条件 / 等待原因 / 状态
+node cli.js cond add 512890 --side buy --qty 9000 --price 1.195 --op "<=" --at 09:45 --mode all --note "回踩下轨，见今日计划第 2 项"
+node cli.js cond add 512890 --side sell --at 14:50 --note "尾盘不留隔夜"
+node cli.js cond add ... [--limit 1.19] [--from 09:30] [--to 14:57] [--expire 2026-11-16]
+node cli.js cond check [--force] [--dry-run]  # 判定并执行；盯盘进程每轮自动调用
+node cli.js cond rm C01 | off C01 | on C01
+node cli.js cond prune
+
 # 运维
-npm test                               # 规则 + 护栏 + 日志 + 区间 + 自选 五套用例
+npm test                               # 规则 + 护栏 + 日志 + 区间 + 自选 + 盯盘 + 条件单 七套用例
 node server.js                         # 前台起服务（NO_OPEN=1 不开浏览器）
 TD_FORCE_SESSION=1 node server.js      # 收盘后调试区间监控用（忽略交易时段）
 ```
@@ -247,8 +256,9 @@ node cli.js live halt | resume       # 暂停告警 / 恢复
 node cli.js live off
 ```
 
-- **只卖不买**：算止损/止盈/结构信号，命中可调 `cli.js sell`；买入要判断，留给 09:45 / 14:40。
+- **只卖不买**：算止损/止盈/结构信号，命中可调 `cli.js sell`；买入决策不进这个进程。
 - **默认只告警**：`--auto` 才真下单。宁可漏一次自动止损，也不让没有判断力的进程乱卖。
+- **条件单不受 `--auto` 约束**：那是事先写死的明确指令，每轮 20s 会叫一次 `cond check`，触发即执行。
 - 互动接口在 `127.0.0.1:5194`（`GET /state`、`POST /cmd`），只绑回环。
 - 盯盘进程挂了不影响定时任务：`wake.js` 每条命令自带 `ensureServer()`，状态全落盘。
 
@@ -261,6 +271,45 @@ node cli.js live off
 3. 新版自动加版本头：`> 计划区 ｜ 交易日 … ｜ 第 N 版 ｜ 写入 HH:MM`。
 
 所以盘中用覆盖式也不会丢对照链了，但**仍然该用 `--append`**——归档是兜底，不是许可证。
+
+## 14. 条件单（到价 / 到点自动委托）
+
+盯盘台的三层触发，分工别搞混：
+
+| 层 | 文件 | 干什么 | 会不会下单 |
+|---|---|---|---|
+| 区间 | `core/bands.js` | 价格穿越时叫醒人 / agent，落告警 | 不会 |
+| 风控 | `core/live.js` | 止损、止盈、弱于大盘，对**已持仓** | `--auto` 才下 |
+| 条件单 | `core/cond.js` | 事先写好的「到这个价 / 到这个点做这笔」 | 触发即下 |
+
+**为什么需要**：09:45 和 14:40 之间没人看盘，区间只叫醒不下单。条件单把「我打算在 1.195 买 9000 股」这种意图固化成数据，到点由盯盘进程执行。
+
+三种形态：
+
+```bash
+# 纯到价（回踩买入，窗口内任意时刻跌破就买）
+node cli.js cond add 512890 --side buy --qty 9000 --price 1.195 --op "<=" --note "..."
+# 纯到点（尾盘减仓）
+node cli.js cond add 512890 --side sell --qty 4500 --at 14:50 --note "..."
+# 时间与价格都满足（默认 --mode all；--mode any 为任一满足）
+node cli.js cond add 512890 --side buy --qty 9000 --at 09:45 --price 1.195 --op "<=" --note "..."
+```
+
+硬规矩：
+
+1. **理由必填**（`--note`）。没有理由的挂单只是一时冲动的固化，跟观察池同一套逻辑。
+2. **买入数量先用 `node cli.js buy <code> <qty> --dry-run` 过一遍**。条件单触发才失败就白等一天；最小一手金额、单笔 ≥1 万、单票 ≤1.5 万这些闸门要在建单时先撞一遍。
+3. **一次性**：触发即置 `fired`，不重复执行。执行失败记 `attempts`，满 3 次转 `error` 停下等人，不会无限重试把仓位打乱。
+4. **撤销用 `cond off C01`**，不要手改 `data/cond.json`。
+5. 卖出条件单不写 `--qty` 表示「全部可卖」，执行时才去查持仓。
+
+已知近似（下收益率结论前要看）：
+
+- 判定只认**当前价**，不做历史极值回溯。20s 一轮会漏掉极短插针——这是刻意的，比「建单前已经触过的价立即成交」安全。
+- 时间条件用的是「不早于」语义：`--at 09:45` 的单，若 09:45 那轮服务没起来，14:40 那轮仍会补做。漏做比晚做强，但复盘时要认这个差异。
+- 执行窗口默认 `09:30~14:57`。收盘后跑 `cond check` 会因窗口边界一律不触发（`--force` 也不改窗口，窗口属于条件本身）。
+
+agent 与条件单的关系：`plan` 任务把今日计划里的「候选 + 价位 + 数量」落成条件单（见 `tools/prompts/plan.md` 第四步），`open` / `midday` / `tail` 三个窗口先跑一次 `cond check` 兜底，再处理自己的事。
 
 ---
 

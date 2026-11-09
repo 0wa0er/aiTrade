@@ -5,6 +5,7 @@
 ## 第 0 步
 1. `node cli.js status` → 休市/不可委托：一行说明，不写日志，结束。
 2. `node cli.js alert poll --check` → `PENDING` 逐条处理（核对 → 判真伪 → 处置 → `ack`）。
+3. `node cli.js cond check` → 执行今日到点/到价的条件单，核对结果。**收盘前把未触发的单处理掉**：今日没机会的 `node cli.js cond off <ID>` 或留到明日（有效期未到会自动顺延），不要让一堆过期判据堆着。
 
 ## 第 1 步 · 读计划与风险
 - `node cli.js journal show` 读今日计划（含盘中 `--append` 的变更，以最新为准）。

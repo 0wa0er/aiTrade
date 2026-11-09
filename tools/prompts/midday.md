@@ -7,6 +7,7 @@
 ## 第 0 步
 1. `node cli.js status` → 休市/不可委托：一行说明，不写日志，结束。
 2. `node cli.js alert poll --check` → `PENDING` 逐条处理（核对 → 判真伪 → 处置 → `ack`）。
+3. `node cli.js cond check` → 条件单判定。午间不是主战场，只核对执行结果与失败原因，**不要临时加新单**（那属于改计划，走 `journal plan --append` + 明日再说）。
 
 ## 第 1 步 · 持仓风控
 `node cli.js risk`：
