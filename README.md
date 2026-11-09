@@ -133,6 +133,7 @@ server.js            HTTP 服务 + 撮合核心 + 除权处理 + 区间监控
 core/rules.js        交易规则纯函数（时段/板块/单位/涨跌幅/笼子/费用）
 core/journal.js      日志引擎（锚点分区、按时间插入、自动索引）
 core/bands.js        区间判定、告警队列、二次分析进程拉起
+core/watch.js        自选股（观察池）进出机制
 cli.js               命令行 + 风控闸门
 public/              前端（原生 JS，图表用本地 echarts）
 data/fees.json       券商费率
@@ -159,7 +160,7 @@ test/                规则、护栏、日志、区间四套用例
 ## 测试
 
 ```bash
-npm test    # 70 项：交易规则 10 + 风控护栏 28 + 日志引擎 15 + 区间触发 17
+npm test    # 89 项：交易规则 10 + 风控护栏 28 + 日志引擎 15 + 区间触发 17 + 自选股 19
 ```
 
 改 `server.js` / `core/*` / `cli.js` 后必须跑一遍。
