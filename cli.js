@@ -23,6 +23,12 @@
  *   node cli.js alert poll [--check]                     待处理告警；--check 先补一次区间判定（无则输出 IDLE）
  *   node cli.js alert ack A0001 --note "结论"             标记已处理
  *
+ * 自选股（观察池，进场有闸门、到期自动退役）：
+ *   node cli.js watch list                                清单：来源 / 剩余观察日 / 理由
+ *   node cli.js watch add 600900 --note "回踩 MA20 等买点" [--source plan] [--ttl 5]
+ *   node cli.js watch rm 600900 [--reason "已证伪"]       手动移出
+ *   node cli.js watch prune [--dry-run]                   退役：观察期满 / 已建仓 / 超上限
+ *
  * 日志（规范见 data/journal/README.md，务必走这里，不要手写文件）：
  *   node cli.js note [--tag 交易] "内容"   追加一条时间线记录（标签：计划/交易/风控/复盘/运维/自检/记录）
  *   node cli.js journal plan  "..."        覆盖写入「今日计划」区（加 --append 追加；可 --file 或用管道）
@@ -41,6 +47,7 @@ const { spawn } = require('child_process');
 const R = require('./core/rules');
 const J = require('./core/journal');
 const B = require('./core/bands');
+const W = require('./core/watch');
 
 const ROOT = __dirname;
 const DATA = path.join(ROOT, 'data');
@@ -611,6 +618,20 @@ function padW(s, w) {
   const str = String(s);
   return str + ' '.repeat(Math.max(0, w - wOf(str)));
 }
+/** 按显示宽度截断（超宽补省略号），避免长名称把表格列挤歪 */
+function clipW(s, w) {
+  const str = String(s);
+  if (wOf(str) <= w) return str;
+  let out = '';
+  let n = 0;
+  for (const ch of str) {
+    const cw = wOf(ch);
+    if (n + cw > w - 1) break;
+    out += ch;
+    n += cw;
+  }
+  return out + '…';
+}
 
 async function cmdBand(rest, argv) {
   const sub = rest[0] || 'list';
@@ -784,6 +805,181 @@ function probeAgent(entry, cfg) {
   });
 }
 
+// ---------------- 自选股生命周期 ----------------
+/**
+ * 自选股 = 待观察清单，不是候选池。进入要过闸门（资质/一手金额/上限/必须写理由），
+ * 退出靠观察期到期自动退役（只退役计划来源的，手动加的不动）。
+ * 设计目的：让「08:45 选出候选 → 盘中有人盯 → 到期自动清掉」闭环，且不靠人记得删。
+ */
+async function cmdWatch(rest, argv) {
+  const sub = rest[0] || 'list';
+  const hs = holidays();
+  const today = R.tradingDateKey(new Date(), hs);
+
+  if (sub === 'list') {
+    const d = await api('/api/dashboard');
+    const list = d.watch || [];
+    if (!list.length) {
+      console.log('自选股为空。加一只：node cli.js watch add 600900 --note "为什么盯它"');
+      return;
+    }
+    const st = W.stats(list, today, hs);
+    console.log(
+      `${C.b}自选股${C.x} ${st.total} 只　手动 ${st.manual}　计划观察 ${st.plan}/${W.MAX_PLAN}　总数上限 ${W.MAX_TOTAL}` +
+        (st.expiring ? `　${C.y}${st.expiring} 只今明两日到期${C.x}` : '')
+    );
+    console.log(
+      `${C.d}${padW('代码', 8)}${padW('名称', 16)}${padW('现价', 10)}${padW('来源', 8)}${padW('剩余', 12)}理由${C.x}`
+    );
+    for (const w of list) {
+      const isPlan = (w.source || 'manual') === 'plan';
+      const dp = w.type === 'fund' ? 4 : w.price != null && w.price < 10 ? 3 : 2;
+      const px = w.price == null ? '—' : Number(w.price).toFixed(dp);
+      const left = W.daysLeft(w, today, hs);
+      const expText = isPlan ? (left === 0 ? '今日到期' : `剩 ${left} 日`) : '—';
+      const expCell = padW(expText, 12);
+      const expColored = isPlan ? (left <= 1 ? `${C.y}${expCell}${C.x}` : `${C.g}${expCell}${C.x}`) : `${C.d}${expCell}${C.x}`;
+      const short = clipW(w.note || '', 20);
+      console.log(
+        `${padW(w.code, 8)}${padW(clipW(w.name, 15), 16)}${padW(px, 10)}${padW(isPlan ? '计划' : '手动', 8)}${expColored}${C.d}${short}${C.x}`
+      );
+    }
+    return;
+  }
+
+  if (sub === 'add') {
+    const codes = rest.slice(1).filter((c) => /^\d{6}$/.test(c));
+    if (!codes.length) {
+      throw new Error(
+        '用法：node cli.js watch add 600900 [600028 ...] [--note "为什么盯它"] [--source plan] [--ttl 5]'
+      );
+    }
+    const cfg = loadCfg();
+    const dash = await api('/api/dashboard');
+    const list = (dash.watch || []).slice();
+    const risk = riskContext(cfg, dash);
+    const note = argv.note && argv.note !== 'true' ? String(argv.note) : '';
+    const source = argv.source === 'plan' ? 'plan' : 'manual';
+    const ttl = num(argv.ttl, W.DEFAULT_TTL);
+    const added = [];
+    const refreshed = [];
+    const skipped = [];
+
+    for (const code of codes) {
+      const type = argv.type && argv.type !== 'true' ? String(argv.type) : typeOf(code);
+      const secid = secidOf(code);
+      let q = null;
+      try {
+        q = (await api(`/api/detail?secid=${secid}&code=${code}&type=${type}`)).quote;
+      } catch (e) {
+        skipped.push(`${code} 取不到行情（${e.message}）`);
+        continue;
+      }
+      const name = (q && q.name) || (argv.name && argv.name !== 'true' ? String(argv.name) : '') || '';
+      const price = num(q && q.price);
+      if (!(price > 0)) {
+        skipped.push(`${code} 无现价`);
+        continue;
+      }
+      const perm = R.permissionOf({ code, name, type, permissions: cfg.account && cfg.account.permissions });
+      if (!perm.allowed) {
+        skipped.push(`${code} ${name} 不可交易（${perm.reason}）`);
+        continue;
+      }
+      if (price > risk.maxPricePerShare) {
+        skipped.push(`${code} ${name} 单价 ${price} 超过上限 ${risk.maxPricePerShare}`);
+        continue;
+      }
+      const lot = R.lotOf(code, type);
+      const r = W.decideAdd({
+        raw: { secid, code, name, type, source, note, ttlDays: ttl, addedOn: today },
+        list,
+        today,
+        holidays: hs,
+        limits: { maxSingleValue: risk.maxSingleValue, oneLotValue: price * lot.buyMin },
+      });
+      if (r.action === 'reject') {
+        skipped.push(`${code} ${name}：${r.reason}`);
+        continue;
+      }
+      await api('/api/watch', { method: 'POST', body: { action: 'add', ...r.item } });
+      if (r.action === 'add') {
+        list.push(r.item);
+        added.push(r.item);
+      } else {
+        const i = list.findIndex((w) => w.secid === r.item.secid);
+        if (i >= 0) list[i] = r.item;
+        refreshed.push(r.item);
+      }
+    }
+
+    for (const it of added) {
+      const tail = it.source === 'plan' ? `计划观察 ${it.ttlDays} 交易日，至 ${it.expireOn}` : '手动，不过期';
+      console.log(`${C.g}✓${C.x} 自选+ ${it.code} ${it.name}（${tail}）`);
+    }
+    for (const it of refreshed) {
+      const tail = it.source === 'plan' ? `观察期已续至 ${it.expireOn}` : '已在自选，理由已更新';
+      console.log(`${C.d}·${C.x} ${it.code} ${it.name}　${tail}`);
+    }
+    for (const s of skipped) console.log(`${C.y}·${C.x} 跳过 ${s}`);
+
+    if (added.length) {
+      J.appendTimeline({
+        text:
+          `自选+ ${added.map((i) => `${i.code} ${i.name}`).join('、')}` +
+          `（${source === 'plan' ? '计划观察 ' + ttl + ' 交易日' : '手动'}${note ? '：' + note : ''}）`,
+        tag: source === 'plan' ? '计划' : '记录',
+      });
+    }
+    if (!added.length && !refreshed.length) process.exitCode = 2;
+    return;
+  }
+
+  if (sub === 'rm' || sub === 'del') {
+    const code = rest[1];
+    if (!/^\d{6}$/.test(code || '')) throw new Error('用法：node cli.js watch rm 600900 [--reason "已证伪"]');
+    const d = await api('/api/dashboard');
+    const w = (d.watch || []).find((x) => String(x.code) === code);
+    if (!w) {
+      console.log(`${C.d}自选里没有 ${code}${C.x}`);
+      return;
+    }
+    await api('/api/watch', { method: 'POST', body: { action: 'remove', secid: w.secid } });
+    const reason = argv.reason && argv.reason !== 'true' ? String(argv.reason) : '';
+    console.log(`${C.g}✓${C.x} 自选- ${code} ${w.name}${reason ? `（${reason}）` : ''}`);
+    J.appendTimeline({ text: `自选- ${code} ${w.name}${reason ? `（${reason}）` : ''}`, tag: '记录' });
+    return;
+  }
+
+  if (sub === 'prune') {
+    const d = await api('/api/dashboard');
+    const list = d.watch || [];
+    const holdings = (d.positions || []).filter((p) => num(p.qty) > 0).map((p) => String(p.code));
+    const { keep, removed } = W.pruneList({ list, today, holdings });
+    const dry = argv['dry-run'] === 'true' || argv.dryRun === 'true';
+    if (!removed.length) {
+      console.log(`${C.d}自选无变化（${keep.length} 只；无到期、无已建仓、未超限）${C.x}`);
+      return;
+    }
+    for (const r of removed) console.log(`${C.y}−${C.x} ${r.code} ${r.name}　${r.reason}`);
+    if (dry) {
+      console.log(`${C.d}（--dry-run，未实际删除；去掉该参数才生效）${C.x}`);
+      return;
+    }
+    for (const r of removed) {
+      await api('/api/watch', { method: 'POST', body: { action: 'remove', secid: r.secid } });
+    }
+    console.log(`${C.g}✓${C.x} 已退役 ${removed.length} 只，自选余 ${keep.length} 只`);
+    J.appendTimeline({
+      text: `自选清理 ${removed.length} 只：${removed.map((r) => `${r.code}（${r.reason}）`).join('；')}，余 ${keep.length} 只`,
+      tag: '记录',
+    });
+    return;
+  }
+
+  throw new Error('用法：node cli.js watch list | add <代码> --note "..." [--source plan] [--ttl 5] | rm <代码> | prune [--dry-run]');
+}
+
 // ---------------- 告警队列 ----------------
 async function cmdAlert(rest, argv) {
   const sub = rest[0] || 'poll';
@@ -871,6 +1067,7 @@ async function main() {
       case 'status': await cmdStatus(); break;
       case 'risk': await cmdRisk(); break;
       case 'band': await cmdBand(rest, argv); break;
+      case 'watch': await cmdWatch(rest, argv); break;
       case 'alert': await cmdAlert(rest, argv); break;
       case 'scan': await cmdScan(argv); break;
       case 'quote':

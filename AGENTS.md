@@ -75,6 +75,7 @@ node cli.js status                   # ③ 账户、时段、持仓、挂单、�
 | `core/rules.js` | 交易规则纯函数（时段/板块/单位/涨跌幅/笼子/费用） | 同上，需补用例 |
 | `core/journal.js` | 日志引擎（锚点、插入、索引） | 同上 |
 | `core/bands.js` | 区间判定 + 告警队列 + 二次分析进程拉起 | 改后必须跑 `npm test` |
+| `core/watch.js` | 自选股生命周期（进场闸门 / 到期退役） | 改后必须跑 `npm test` |
 | `cli.js` | 命令行 + **风控闸门** | 改后必须跑 `npm test` |
 | `public/` | 前端（app.js / index.html / style.css） | 截图自检 |
 | `data/autotrade.json` | 风控红线 + **账户资质（`account.permissions`）** | 仅在用户明确要求时；改完即时生效 |
@@ -83,8 +84,8 @@ node cli.js status                   # ③ 账户、时段、持仓、挂单、�
 | `data/alerts.json` | 区间告警队列（pending / acked） | 只通过 cli 或面板确认 |
 | `data/fees.json` | 券商费率（费用改这里） | 重启生效 |
 | `data/journal/` | **业务日志**（每日一篇，规范见其 README） | 只通过 cli 写 |
-| `data/state.json` | 账户状态（程序写，别手改） | 否 |
-| `test/` | `trading.test.js` + `cli.test.js` | 随改动同步 |
+| `data/state.json` | 账户状态（程序写，别手改；`watchlist` 带生命周期字段） | 否 |
+| `test/` | `trading` / `cli` / `journal` / `bands` / `watch` 五套 | 随改动同步 |
 
 ## 5. 命令速查
 
@@ -112,8 +113,14 @@ node cli.js band status                  # 监控进程状态 / 上次检查 / �
 node cli.js alert poll [--check]         # 待处理告警；--check 先补一次判定
 node cli.js alert ack A0001 --note "已核对，假摔"
 
+# 自选股（观察池）
+node cli.js watch list
+node cli.js watch add 600900 --note "回踩 MA20 等买点" --source plan --ttl 5
+node cli.js watch rm 600900 --reason "跌破支撑，证伪"
+node cli.js watch prune [--dry-run]       # 退役：观察期满 / 已建仓 / 超上限
+
 # 运维
-npm test                               # 规则 + 护栏 + 日志 + 区间四套用例
+npm test                               # 规则 + 护栏 + 日志 + 区间 + 自选 五套用例
 node server.js                         # 前台起服务（NO_OPEN=1 不开浏览器）
 TD_FORCE_SESSION=1 node server.js      # 收盘后调试区间监控用（忽略交易时段）
 ```
@@ -171,6 +178,34 @@ TD_FORCE_SESSION=1 node server.js      # 收盘后调试区间监控用（忽略
 **告警的生命周期**：`pending` → `acked`。处理完必须 `alert ack`，否则下一轮巡检会重复处理同一条。分析进程需要 CLI 已登录，未登录时告警状态记为 `auth`，仍然留在队列里由巡检兜底。
 
 **注意**：区间只覆盖价格，不覆盖量能与涨速。触发不等于动作，二次分析环节才是决策点；巡检任务**禁止借告警开新仓**，开仓只在 09:45 / 14:40。
+
+## 10. 自选股（观察池）生命周期
+
+自选股不是候选池，是**待观察清单**。每加一只都在消耗注意力，所以进场有闸门、有理由、有期限；到期自动退役，不用人记得删。逻辑在 `core/watch.js`，纯函数，可单测。
+
+**进（`watch add`）**：四道闸门，任一不过就拒，且拒了不写日志（不制造噪声）
+
+| 闸门 | 规则 |
+|---|---|
+| 可交易性 | `R.permissionOf`，科创板/创业板/北交所/ST/可转债无权限的一律不入 |
+| 一手金额 | `现价 × buyMin ≤ maxSingleValue`（权益×30%，随权益浮动）。买不了的别占观察位 |
+| 单价上限 | 现价 ≤ `risk.maxPricePerShare`（默认 130） |
+| 容量 | 总数 ≤ 12，其中 `source=plan` ≤ 4；计划候选最多 3 只，一一对应 |
+| 理由 | `source=plan` 必须带 `--note`，没理由不入池 |
+
+重复 add 是**幂等刷新**（更新理由、顺延观察期），不报错、不产生第二条；手动项被计划重复添加时保持手动身份，不会被设到期日。
+
+**出（`watch prune`）**：只退役 `source=plan` 的条目，三种情况
+
+1. 已建仓 → 移出（持仓区已在跟踪，留着是重复占位）
+2. `expireOn < 今天` → 观察期满（默认 5 个**交易日**，节假日自动跳过）
+3. 超出总数上限 → 淘汰最久未更新的计划项
+
+**手动添加的（含历史遗留无 `source` 的）永不自动删**——用户的清单归用户。要删只能 `watch rm`。
+
+**谁在动它**：08:45 盘前计划写完后 `prune` + 把候选同步进池（`--source plan --ttl 5`）；15:15 收盘复盘 `watch list` 检视 + `rm` 掉证伪的 + `prune` 收尾。09:45 / 11:25 / 14:40 **只读不动**（`watch list` 可选），避免每天多出无关写入。
+
+**别做的事**：不要为了「留档」给到期票续期（逻辑还成立才续）；不要用 `watch add` 堆一屏长期票（那是把观察池当收藏夹）；不要在任务里自动建区间——区间是穿越触发，给观察票乱建会天天制造噪声告警。
 
 ---
 

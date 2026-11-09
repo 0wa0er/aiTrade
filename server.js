@@ -2002,8 +2002,20 @@ async function handleApi(req, res, url) {
       if (body.action === 'add') {
         const item = { secid: body.secid, code: body.code, name: body.name, type: body.type || 'stock' };
         if (!item.secid || !item.code) throw new Error('缺少代码');
-        if (st.watchlist.some((w) => w.secid === item.secid)) throw new Error('已在自选中');
-        st.watchlist.push(item);
+        // 生命周期字段（source/note/到期日）由 core/watch.js 在 CLI 侧算好，这里只做白名单透传
+        for (const k of ['source', 'note', 'addedOn', 'expireOn', 'ttlDays']) {
+          if (body[k] != null && body[k] !== '') item[k] = body[k];
+        }
+        const exist = st.watchlist.find((w) => w.secid === item.secid);
+        if (exist) {
+          // 幂等：重复添加按「刷新观察期」处理，任务侧不该因为计划重复列同一只而失败
+          if (item.note) exist.note = item.note;
+          if ((exist.source || 'manual') === 'plan') {
+            for (const k of ['ttlDays', 'addedOn', 'expireOn']) if (item[k] != null) exist[k] = item[k];
+          }
+        } else {
+          st.watchlist.push(item);
+        }
       } else if (body.action === 'remove') {
         st.watchlist = st.watchlist.filter((w) => w.secid !== body.secid);
       } else if (body.action === 'move') {

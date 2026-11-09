@@ -186,7 +186,7 @@ function renderWatch() {
         ? ` title="行情时间 ${new Date(w.marketTs).toLocaleTimeString('zh-CN', { hour12: false })}"`
         : '';
       return `<div class="watch-row ${S.sel && S.sel.secid === w.secid ? 'active' : ''} ${has ? '' : 'missing'}" data-secid="${w.secid}"${timeTip}>
-        <div class="wr-name"><b>${w.name}</b>${flag}<small>${w.code}${w.type === 'fund' ? ' · 基金' : ''}</small></div>
+        <div class="wr-name"><b>${w.name}</b>${flag}<small>${w.code}${w.type === 'fund' ? ' · 基金' : ''}${w.source === 'plan' ? ` · 观察至 ${String(w.expireOn || '').slice(5)}` : ''}</small></div>
         <div class="wr-price ${pctCls}">${has ? fmt(w.price, dp) : '--'}</div>
         <div class="wr-pct ${pctCls}">${has ? fmtPct(w.pct) : '--'}</div>
         <button class="del" data-del="${w.secid}" title="移除">×</button>
