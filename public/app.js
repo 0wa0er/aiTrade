@@ -47,6 +47,10 @@ const S = {
   permission: null, // 当前标的的账户交易权限（来自 /api/detail）
   baseHint: '',     // 下单提示的默认文案，权限拦截时会被覆盖
   chart: null,
+  bands: null,        // /api/bands 快照（区间面板打开时才拉）
+  bandsLoading: false,
+  bandsAt: 0,
+  bandsTryAt: 0,
   chartSeq: 0,
   loading: false,   // 请求中的互斥标记，防止上游变慢时请求堆叠
 };
@@ -813,6 +817,91 @@ async function submitOrder() {
 }
 
 /* ============ 底部面板 ============ */
+/* ============ 价格区间 ============ */
+async function loadBands() {
+  if (S.bandsLoading) return;
+  if (Date.now() - (S.bandsTryAt || 0) < 3000) return; // 防抖，同时防止请求失败后无限重试
+  S.bandsTryAt = Date.now();
+  S.bandsLoading = true;
+  try {
+    S.bands = await api('/api/bands');
+    S.bandsAt = Date.now();
+    const n = (S.bands.alerts || []).length;
+    const tab = $('#bottomTabs .tab[data-view="bands"]');
+    if (tab) tab.textContent = n ? `区间 ${n}` : '区间';
+  } catch (e) {
+    S.bands = null;
+    toast(e.message, 'err');
+  } finally {
+    S.bandsLoading = false;
+    if (S.bottomView === 'bands') renderBottom();
+  }
+}
+
+function bindBands() {
+  const body = $('#bottomBody');
+  if (!body || body.dataset.bandsBound === '1') return;
+  body.dataset.bandsBound = '1';
+
+  body.addEventListener('click', async (e) => {
+    if (e.target.closest('#bSave')) {
+      const sel = S.sel;
+      if (!sel) return toast('先在左侧选一个标的', 'err');
+      const lower = $('#bLower').value.trim();
+      const upper = $('#bUpper').value.trim();
+      if (!lower && !upper) return toast('上轨、下轨至少填一个', 'err');
+      try {
+        await api('/api/bands', {
+          method: 'POST',
+          body: {
+            action: 'set',
+            band: {
+              code: sel.code,
+              secid: sel.secid,
+              name: sel.name,
+              type: sel.type,
+              lower: lower || null,
+              upper: upper || null,
+              action: $('#bAction').value,
+              cooldownMin: Number($('#bCool').value) || 30,
+              note: $('#bNote').value.trim(),
+            },
+          },
+        });
+        toast('区间已保存', 'ok');
+        S.bands = null;
+        loadBands();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+      return;
+    }
+
+    const btn = e.target.closest('[data-bact]');
+    if (!btn) return;
+    const { bact, id } = btn.dataset;
+    try {
+      if (bact === 'del') {
+        if (!confirm('删除该区间？')) return;
+        await api('/api/bands', { method: 'POST', body: { action: 'del', id } });
+        toast('已删除', 'ok');
+      } else if (bact === 'toggle') {
+        await api('/api/bands', { method: 'POST', body: { action: 'toggle', id, enabled: btn.dataset.en === '1' } });
+      } else if (bact === 'fire') {
+        await api('/api/bands', { method: 'POST', body: { action: 'fire', id } });
+        toast('已手动触发，时间线已留痕', 'ok');
+      } else if (bact === 'ack') {
+        await api('/api/bands', { method: 'POST', body: { action: 'ack', id, note: '面板确认' } });
+        toast('已标记处理', 'ok');
+      }
+      S.bands = null;
+      loadBands();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  });
+}
+
 function renderBottom() {
   const body = $('#bottomBody');
   const sum = $('#bottomSum');
@@ -927,6 +1016,90 @@ function renderBottom() {
           <td class="${cls(t.realizedPnl || 0)}">${t.realizedPnl != null ? sign(t.realizedPnl) + fmt(t.realizedPnl) : '--'}</td>
         </tr>`;
       }).join('')}</tbody></table>`;
+    return;
+  }
+
+  if (S.bottomView === 'bands') {
+    if (S.bands && Date.now() - (S.bandsAt || 0) > 15000) loadBands(); // 面板打开时静默刷新
+    if (!S.bands) {
+      body.innerHTML = '<div class="empty">加载区间配置…</div>';
+      loadBands();
+      return;
+    }
+    const d = S.bands;
+    const list = d.bands || [];
+    const armed = list.filter((b) => b.enabled && b.armed).length;
+    sum.innerHTML = `<span>区间 <b>${list.length}</b></span>
+      <span>已武装 <b>${armed}</b></span>
+      <span>待处理告警 <b class="${d.alerts.length ? 'st-partial' : ''}">${d.alerts.length}</b></span>
+      <span>监控 <b>${d.live.startAt ? '运行中' : '未启动'}</b> · 自动分析 <b class="${d.agent.enabled ? 'up' : 'flat'}">${d.agent.enabled ? '开' : '关'}</b></span>`;
+
+    const sel = S.sel || {};
+    const cur = list.find((b) => b.code === sel.code);
+    const esc = (s) => String(s == null ? '' : s).replace(/"/g, '&quot;').replace(/</g, '&lt;');
+    const dp = (code) => (/^\d{6}$/.test(code || '') && /^[15]/.test(code) ? 3 : 2);
+
+    const rows = list.map((b) => {
+      const px = b.prevPrice;
+      let pos = '<span class="flat">—</span>';
+      if (px != null) {
+        const d3 = dp(b.code);
+        if (b.upper != null && px >= b.upper) pos = `<span class="up">已破上轨 +${(((px - b.upper) / b.upper) * 100).toFixed(2)}%</span>`;
+        else if (b.lower != null && px <= b.lower) pos = `<span class="down">已破下轨 ${(((px - b.lower) / b.lower) * 100).toFixed(2)}%</span>`;
+        else {
+          const bits = [];
+          if (b.upper != null) bits.push(`距上 ${(((px - b.upper) / b.upper) * 100).toFixed(2)}%`);
+          if (b.lower != null) bits.push(`距下 ${(((px - b.lower) / b.lower) * 100).toFixed(2)}%`);
+          pos = `<span class="flat">${bits.join(' / ')}</span>`;
+        }
+      }
+      return `<tr>
+        <td class="flat">${b.id}</td>
+        <td><div class="nm"><b>${b.name}</b><small>${b.code}</small></div></td>
+        <td>${b.lower != null ? fmt(b.lower, dp(b.code)) : '—'} ~ ${b.upper != null ? fmt(b.upper, dp(b.code)) : '—'}</td>
+        <td>${px != null ? fmt(px, dp(b.code)) : '—'}</td>
+        <td>${pos}</td>
+        <td class="${b.enabled ? (b.armed ? 'st-filled' : 'st-partial') : 'st-cancelled'}">${b.enabled ? (b.armed ? '已武装' : '待回位') : '停用'}</td>
+        <td class="flat">${b.action === 'analyze' ? '自动分析' : '仅提醒'} · ${b.cooldownMin}m</td>
+        <td><div class="ops">
+          <button data-bact="fire" data-id="${b.id}">试触发</button>
+          <button data-bact="toggle" data-id="${b.id}" data-en="${b.enabled ? 0 : 1}">${b.enabled ? '停用' : '启用'}</button>
+          <button class="cancel" data-bact="del" data-id="${b.id}">删除</button>
+        </div></td>
+      </tr>`;
+    }).join('');
+
+    const alerts = (d.alerts || []).map((a) => `<div class="alert-item">
+        <b>${a.id}</b> ${a.time} ${a.name}(${a.code})
+        <span class="${a.side === 'upper' ? 'up' : 'down'}">${a.side === 'upper' ? '上破' : '下破'} ${a.side === 'upper' ? a.upper : a.lower}</span>
+        · 现价 ${a.price} · ${a.action === 'analyze' ? '自动分析' : '仅提醒'}
+        ${a.agent ? ` · 分析：${{ running: '进行中', done: '已完成', queued: '排队', skipped: '跳过', auth: 'CLI 未登录', failed: '失败' }[a.agent.state] || a.agent.state}` : ''}
+        <button class="mini" data-bact="ack" data-id="${a.id}">标记已处理</button>
+      </div>`).join('');
+
+    body.innerHTML = `
+      <div class="band-form">
+        <div class="bf-line">
+          <span class="bf-title">为 <b>${sel.name || '—'}</b> <small>${sel.code || '先在左侧选标的'}</small> 设区间</span>
+          <input id="bLower" type="number" step="0.001" placeholder="下轨" value="${cur && cur.lower != null ? cur.lower : ''}" />
+          <input id="bUpper" type="number" step="0.001" placeholder="上轨" value="${cur && cur.upper != null ? cur.upper : ''}" />
+          <select id="bAction">
+            <option value="analyze"${!cur || cur.action === 'analyze' ? ' selected' : ''}>触发 → 自动二次分析</option>
+            <option value="notify"${cur && cur.action === 'notify' ? ' selected' : ''}>触发 → 仅提醒</option>
+          </select>
+          <input id="bCool" type="number" step="5" min="1" title="冷却（分钟），冷却期内不重复触发" value="${cur ? cur.cooldownMin : 30}" />
+          <input id="bNote" type="text" placeholder="备注（可选）" value="${esc(cur && cur.note)}" />
+          <button id="bSave" class="minip">保存</button>
+        </div>
+        <div class="bf-tip">穿越才触发：上破需前值在上轨下、现价到上轨上方；触发后要回到区间内（缓冲 ${cur ? cur.resetPct : 0.3}%）才重新武装。监控需服务常驻（双击 start.bat）。</div>
+      </div>
+      ${alerts ? `<div class="alert-strip"><div class="alert-head">待处理告警 ${d.alerts.length} 条</div>${alerts}</div>` : ''}
+      ${list.length
+        ? `<table class="grid">
+            <thead><tr><th>ID</th><th>名称 / 代码</th><th>区间</th><th>最新价</th><th>位置</th><th>状态</th><th>动作</th><th>操作</th></tr></thead>
+            <tbody>${rows}</tbody></table>`
+        : '<div class="empty">还没有区间。先在左侧选一个标的，填上轨 / 下轨后保存。</div>'}
+    `;
     return;
   }
 
@@ -1170,6 +1343,7 @@ async function boot() {
   initChart();
   bindEvents();
   bindSearch();
+  bindBands();
 
   // 支持 ?kind=day|week|month|trend5 直接打开指定图表
   const params = new URLSearchParams(location.search);
@@ -1179,7 +1353,7 @@ async function boot() {
     $$('#chartTabs .tab').forEach((t) => t.classList.toggle('active', t.dataset.kind === kindParam));
   }
   const viewParam = params.get('view');
-  if (['positions', 'orders', 'trades', 'rules'].includes(viewParam)) S.bottomView = viewParam;
+  if (['positions', 'orders', 'trades', 'bands', 'rules'].includes(viewParam)) S.bottomView = viewParam;
 
   await loadDashboard();
 

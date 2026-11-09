@@ -1,0 +1,56 @@
+{
+  "_说明": "价格区间触发器配置。bands 为区间规则（一只票一条），agent 控制触发后是否自动发起二次分析。运行态写入 bands.state.json，告警写入 alerts.json，此文件可随时手改也可用 node cli.js band 维护。",
+  "pollSeconds": 20,
+  "agent": {
+    "_说明": "enabled=false 时只做『落盘告警 + 写时间线』，由定时『区间巡检』任务兜底消费；置 true 且本机 CLI 已登录时，触发即起分析进程。",
+    "enabled": false,
+    "entry": "",
+    "model": "",
+    "timeoutMs": 900000,
+    "promptTemplate": "【区间触发 · 二次分析】{name}（{code}）现价 {price}，{sideText}。告警号 {alertId}。\n工作目录 D:/workTest/trade-desk，先读 AGENTS.md，再读今日日志。\n只做三件事：\n1) node cli.js quote {code} 核对现价与量能，确认不是行情缓存错误；\n2) 判断是真突破还是插针噪声：看分时是否回抽、量能是否配合、所属板块是否同步；\n3) 给结论：维持原计划 / 修正计划 / 触发风控动作。需要动作时，先在时间线 note 说明依据。\n禁止自行开新仓买入；卖出必须符合计划与 data/autotrade.json 风控。\n收尾必须执行：node cli.js alert ack {alertId} --note \"一句话结论\"，把告警标记为已处理。\n全程中文，结论不超过 200 字。"
+  },
+  "bands": [
+    {
+      "id": "B01",
+      "code": "512890",
+      "secid": "1.512890",
+      "name": "红利低波ETF",
+      "type": "etf",
+      "lower": 1.225,
+      "upper": 1.245,
+      "action": "analyze",
+      "cooldownMin": 30,
+      "resetPct": 0.3,
+      "enabled": true,
+      "note": "下破 1.225=MA20 失守，防御逻辑失效；上破 1.245 已贴 52 周高 1.254，属追高区"
+    },
+    {
+      "id": "B02",
+      "code": "600900",
+      "secid": "1.600900",
+      "name": "长江电力",
+      "type": "stock",
+      "lower": 29.0,
+      "upper": 29.9,
+      "action": "analyze",
+      "cooldownMin": 30,
+      "resetPct": 0.3,
+      "enabled": true,
+      "note": "上破 29.90 为计划第 2 批备选触发价；下破 29.00 表示资金面进一步恶化，作废"
+    },
+    {
+      "id": "B03",
+      "code": "601398",
+      "secid": "1.601398",
+      "name": "工商银行",
+      "type": "stock",
+      "lower": 8.4,
+      "upper": 8.6,
+      "action": "notify",
+      "cooldownMin": 60,
+      "resetPct": 0.3,
+      "enabled": true,
+      "note": "周三批次观察位：8.40 回踩 / 8.60 突破"
+    }
+  ]
+}

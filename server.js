@@ -1624,6 +1624,198 @@ const MIME = {
   '.png': 'image/png',
 };
 
+// ---------------- 价格区间监控（盯盘台主动叫醒） ----------------
+const B = require('./core/bands');
+const J = require('./core/journal');
+const { spawn } = require('child_process');
+
+const BAND_SESSIONS = new Set(['auction', 'auction_lock', 'pre_open', 'open', 'close_auction']);
+const BAND_LIVE = {
+  startAt: 0,
+  checks: 0,
+  lastCheck: null,
+  lastError: null,
+  lastFire: null,
+  agentRunning: false,
+  fired: [],
+};
+let bandTimer = null;
+
+function bandSnapshots() {
+  const cfg = B.loadConfig();
+  const st = B.loadState();
+  return cfg.bands.map((b) => {
+    const s = st.bands[b.id || b.code] || {};
+    return {
+      ...b,
+      armed: s.armed !== false,
+      side: s.side || null,
+      prevPrice: Number.isFinite(Number(s.prevPrice)) ? Number(s.prevPrice) : null,
+      lastFiredAt: s.lastFiredAt || b.lastFiredAt || '',
+    };
+  });
+}
+
+function startBandMonitor() {
+  if (bandTimer) return;
+  BAND_LIVE.startAt = Date.now();
+  scheduleBandTick(1200);
+}
+
+function scheduleBandTick(ms) {
+  if (bandTimer) clearTimeout(bandTimer);
+  bandTimer = setTimeout(bandTick, ms);
+  if (bandTimer.unref) bandTimer.unref();
+}
+
+/** 单次判定：取价 → 判穿越 → 落状态。force=true 时忽略交易时段（手动/巡检调用） */
+async function bandCheck({ force = false } = {}) {
+  const cfg = B.loadConfig();
+  const active = cfg.bands.filter((b) => b.enabled && b.secid);
+  if (!active.length) return { cfg, fired: [], skipped: 'no-bands' };
+  if (!BAND_SESSIONS.has(sessionState().code) && !force) return { cfg, fired: [], skipped: 'closed' };
+  const { map } = await getQuotes(active.map((b) => b.secid));
+  const priceMap = new Map();
+  for (const [secid, q] of map) {
+    priceMap.set(secid, q);
+    if (q && q.code) priceMap.set(q.code, q);
+  }
+  const st = B.rollState(B.loadState());
+  const fired = B.evaluateAll(cfg, st, priceMap, new Date());
+  B.saveState(st);
+  BAND_LIVE.checks += 1;
+  BAND_LIVE.lastCheck = new Date().toISOString();
+  for (const f of fired) await onBandFire(cfg, f);
+  return { cfg, fired, skipped: null };
+}
+
+async function bandTick() {
+  let delay = 20000;
+  try {
+    const cfg = B.loadConfig();
+    delay = Math.max(5, num(cfg.pollSeconds || 20)) * 1000;
+    const r = await bandCheck({ force: process.env.TD_FORCE_SESSION === '1' });
+    if (r.skipped === 'no-bands' || r.skipped === 'closed') delay = 15000;
+  } catch (e) {
+    BAND_LIVE.lastError = e.message;
+  } finally {
+    scheduleBandTick(delay);
+  }
+}
+
+/** 触发后：落盘告警 + 写时间线 + 视配置自动发起二次分析 */
+async function onBandFire(cfg, f) {
+  const { band, side, price } = f;
+  let alert;
+  try {
+    alert = B.pushAlert({ band, side, price, quote: f.quote });
+  } catch (e) {
+    BAND_LIVE.lastError = `告警落盘失败：${e.message}`;
+    return;
+  }
+  BAND_LIVE.lastFire = alert;
+  BAND_LIVE.fired.unshift(alert);
+  BAND_LIVE.fired = BAND_LIVE.fired.slice(0, 20);
+  const act = band.action === 'analyze' ? '自动二次分析' : '仅提醒';
+  try {
+    J.appendTimeline({
+      text: `区间触发「${B.alertText(alert)}」· 动作：${act}${band.note ? ` · ${band.note}` : ''} · 告警号 ${alert.id}`,
+      tag: '风控',
+    });
+  } catch (e) {
+    BAND_LIVE.lastError = `写日志失败：${e.message}`;
+  }
+  console.log(`[band] ${B.alertText(alert)} → ${act}`);
+  if (band.action !== 'analyze' || !cfg.agent || !cfg.agent.enabled) return;
+  runBandAgent(cfg, band, alert);
+}
+
+function patchAlert(id, patch) {
+  const a = B.loadAlerts();
+  const it = a.items.find((x) => x.id === id);
+  if (!it) return null;
+  Object.assign(it, patch);
+  B.saveAlerts(a);
+  return it;
+}
+
+function runBandAgent(cfg, band, alert) {
+  if (BAND_LIVE.agentRunning) {
+    patchAlert(alert.id, { agent: { state: 'queued', note: '已有分析进程在跑，本条留给定时巡检处理' } });
+    return;
+  }
+  const plan = B.spawnAgent(B.buildPrompt(cfg.agent.promptTemplate, band, alert), cfg);
+  if (!plan.ok) {
+    patchAlert(alert.id, { agent: { state: 'skipped', note: plan.note } });
+    return;
+  }
+  const dir = path.join(DATA_DIR, 'agent-runs');
+  fs.mkdirSync(dir, { recursive: true });
+  const logFile = path.join(dir, `${alert.id}-${Date.now()}.log`);
+  let out;
+  try {
+    out = fs.openSync(logFile, 'a');
+  } catch (e) {
+    patchAlert(alert.id, { agent: { state: 'failed', note: `日志打不开：${e.message}` } });
+    return;
+  }
+  const startedAt = new Date().toISOString();
+  BAND_LIVE.agentRunning = true;
+  let child;
+  try {
+    child = spawn(plan.entry.cmd, plan.entry.args, {
+      cwd: ROOT,
+      stdio: ['ignore', out, out],
+      windowsHide: true,
+      env: { ...process.env, NO_OPEN: '1' },
+    });
+  } catch (e) {
+    BAND_LIVE.agentRunning = false;
+    fs.closeSync(out);
+    patchAlert(alert.id, { agent: { state: 'failed', note: `进程启动失败：${e.message}` } });
+    return;
+  }
+  patchAlert(alert.id, {
+    agent: { state: 'running', pid: child.pid, log: path.relative(ROOT, logFile), startedAt },
+  });
+  const timeoutMs = Math.max(60000, num(cfg.agent.timeoutMs, 900000));
+  const killer = setTimeout(() => {
+    try {
+      child.kill();
+    } catch {
+      /* 已退出 */
+    }
+  }, timeoutMs);
+  if (killer.unref) killer.unref();
+  child.on('exit', (code) => {
+    clearTimeout(killer);
+    BAND_LIVE.agentRunning = false;
+    try {
+      fs.closeSync(out);
+    } catch {
+      /* ignore */
+    }
+    let text = '';
+    try {
+      text = fs.readFileSync(logFile, 'utf8').slice(-4000);
+    } catch {
+      /* ignore */
+    }
+    const authFail = /Authentication required|请先登录|not logged in/i.test(text);
+    patchAlert(alert.id, {
+      agent: {
+        state: authFail ? 'auth' : code === 0 ? 'done' : 'failed',
+        code,
+        log: path.relative(ROOT, logFile),
+        startedAt,
+        endedAt: new Date().toISOString(),
+        note: authFail ? 'CLI 未登录：需先在终端完成一次登录，或改用定时巡检兜底' : '',
+      },
+    });
+  });
+}
+
+
 function sendJSON(res, code, payload) {
   const buf = Buffer.from(JSON.stringify(payload), 'utf8');
   res.writeHead(code, {
@@ -1665,6 +1857,81 @@ async function handleApi(req, res, url) {
 
   if (p === '/api/dashboard') {
     return sendJSON(res, 200, { ok: true, data: await buildDashboard() });
+  }
+
+  // 指定标的的最新价（区间监控 / 脚本用，不走自选列表）
+  if (p === '/api/quotes') {
+    const secids = (q.get('secids') || q.get('codes') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 40);
+    if (!secids.length) return sendJSON(res, 200, { ok: true, data: [] });
+    const { map, warnings } = await getQuotes(secids);
+    return sendJSON(res, 200, { ok: true, data: [...map.values()], warnings });
+  }
+
+  // 价格区间：查询 / 增删改 / 手动试触发 / 告警确认
+  if (p === '/api/bands') {
+    if (req.method === 'POST') {
+      const body = await readBody(req);
+      const action = body.action || 'set';
+      if (action === 'set') {
+        const band = B.upsertBand(body.band || body);
+        return sendJSON(res, 200, { ok: true, data: { band, bands: bandSnapshots() } });
+      }
+      if (action === 'del') {
+        B.removeBand(body.id);
+        return sendJSON(res, 200, { ok: true, data: { bands: bandSnapshots() } });
+      }
+      if (action === 'toggle') {
+        B.toggleBand(body.id, body.enabled);
+        return sendJSON(res, 200, { ok: true, data: { bands: bandSnapshots() } });
+      }
+      if (action === 'ack') {
+        const it = B.ackAlert(body.id, { by: body.by || '手动', note: body.note || '' });
+        return sendJSON(res, 200, { ok: true, data: { alert: it, alerts: B.pendingAlerts() } });
+      }
+      if (action === 'agent') {
+        const cfg = B.loadConfig();
+        cfg.agent = { ...cfg.agent, enabled: !!body.enabled };
+        B.saveConfig(cfg);
+        return sendJSON(res, 200, { ok: true, data: { agent: cfg.agent } });
+      }
+      if (action === 'check') {
+        // 供定时巡检任务调用：确保即使盯盘台没常驻，也能补一次区间判定
+        const r = await bandCheck({ force: body.force !== false });
+        return sendJSON(res, 200, {
+          ok: true,
+          data: {
+            skipped: r.skipped,
+            fired: r.fired.map((f) => ({ code: f.band.code, name: f.band.name, side: f.side, price: f.price })),
+            alerts: B.pendingAlerts(),
+          },
+        });
+      }
+      if (action === 'fire') {
+        const cfg = B.loadConfig();
+        const band = cfg.bands.find((x) => x.id === body.id);
+        if (!band) throw new Error(`区间 ${body.id} 不存在`);
+        const price = num(body.price) || num(band.upper == null ? band.lower : band.upper);
+        await onBandFire(cfg, { band, side: body.side === 'lower' ? 'lower' : 'upper', price, quote: null });
+        return sendJSON(res, 200, { ok: true, data: { alerts: B.pendingAlerts() } });
+      }
+      throw new Error(`未知操作：${action}`);
+    }
+    const cfg = B.loadConfig();
+    return sendJSON(res, 200, {
+      ok: true,
+      data: {
+        pollSeconds: cfg.pollSeconds,
+        agent: { enabled: !!(cfg.agent && cfg.agent.enabled), entry: (B.agentEntry(cfg) || {}).entry || '' },
+        bands: bandSnapshots(),
+        alerts: B.pendingAlerts(),
+        recent: B.loadAlerts().items.slice(0, 30),
+        live: { ...BAND_LIVE, fired: BAND_LIVE.fired.slice(0, 10) },
+      },
+    });
   }
 
   if (p === '/api/orders') {
@@ -1837,6 +2104,8 @@ if (require.main === module) {
             : `xdg-open "${url}"`;
       require('child_process').exec(cmd, () => {});
     }
+    // 区间监控：只在服务常驻时生效（浏览器界面开着 = 监控开着）
+    startBandMonitor();
   });
 }
 

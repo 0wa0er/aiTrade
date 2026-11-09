@@ -14,6 +14,15 @@
  *   node cli.js cancel O000001            撤单
  *   node cli.js reset 50000               重置账户
  *
+ * 价格区间（触发即落盘告警，盯盘台常驻时自动发起二次分析）：
+ *   node cli.js band list                                 区间清单 + 现价位置 + 武装状态
+ *   node cli.js band set 512890 --lower 1.225 --upper 1.245 [--action analyze] [--cool 30] [--note "..."]
+ *   node cli.js band del 512890 | band off 512890         删除 / 停用
+ *   node cli.js band agent [--on|--off] [--probe]         自动二次分析开关 / 自检 CLI 可用性
+ *   node cli.js band status                               监控进程状态
+ *   node cli.js alert poll [--check]                     待处理告警；--check 先补一次区间判定（无则输出 IDLE）
+ *   node cli.js alert ack A0001 --note "结论"             标记已处理
+ *
  * 日志（规范见 data/journal/README.md，务必走这里，不要手写文件）：
  *   node cli.js note [--tag 交易] "内容"   追加一条时间线记录（标签：计划/交易/风控/复盘/运维/自检/记录）
  *   node cli.js journal plan  "..."        覆盖写入「今日计划」区（加 --append 追加；可 --file 或用管道）
@@ -31,6 +40,7 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const R = require('./core/rules');
 const J = require('./core/journal');
+const B = require('./core/bands');
 
 const ROOT = __dirname;
 const DATA = path.join(ROOT, 'data');
@@ -587,6 +597,251 @@ async function cmdJournal(rest, argv = {}) {
   }
 }
 
+// ---------------- 区间触发器 ----------------
+function fmtNum(v) {
+  return v == null ? '—' : String(Math.round(num(v) * 1000) / 1000);
+}
+
+/** 显示宽度（中文按 2 格算），用于终端表格对齐 */
+function wOf(s) {
+  return [...String(s)].reduce((n, ch) => n + (/[\u3000-\u9fff\uff00-\uffef]/.test(ch) ? 2 : 1), 0);
+}
+function padW(s, w) {
+  const str = String(s);
+  return str + ' '.repeat(Math.max(0, w - wOf(str)));
+}
+
+async function cmdBand(rest, argv) {
+  const sub = rest[0] || 'list';
+  if (sub === 'list') {
+    const cfg = B.loadConfig();
+    if (!cfg.bands.length) {
+      console.log('还没有设置区间。示例：node cli.js band set 512890 --lower 1.225 --upper 1.245');
+      return;
+    }
+    const st = B.loadState();
+    let live = new Map();
+    try {
+      const d = await api('/api/quotes?secids=' + cfg.bands.map((b) => b.secid).join(','));
+      for (const q of d) {
+        live.set(q.code, q);
+        live.set(q.secid, q);
+      }
+    } catch {
+      /* 服务没起就只显示规则 */
+    }
+    console.log(`${padW('ID', 4)} ${padW('标的', 20)} ${padW('下轨', 8)} ${padW('上轨', 8)} ${padW('现价', 9)} 位置 · 状态`);
+    for (const b of cfg.bands) {
+      const s = st.bands[b.id] || {};
+      const q = live.get(b.code) || live.get(b.secid);
+      const px = q ? num(q.price) : null;
+      let pos = '—';
+      if (px) {
+        if (b.upper != null && px >= b.upper) pos = `${C.r}已破上轨${C.x}`;
+        else if (b.lower != null && px <= b.lower) pos = `${C.g}已破下轨${C.x}`;
+        else {
+          const near = [
+            b.upper != null ? `距上 ${(((px - b.upper) / b.upper) * 100).toFixed(2)}%` : '',
+            b.lower != null ? `距下 ${(((px - b.lower) / b.lower) * 100).toFixed(2)}%` : '',
+          ].filter(Boolean);
+          pos = near.join(' ');
+        }
+      }
+      const armed = s.armed === false ? `${C.y}待回位${C.x}` : `${C.g}已武装${C.x}`;
+      const act = b.action === 'analyze' ? '自动二次分析' : '仅提醒';
+      const head = `${padW(b.id, 4)} ${padW(`${b.name}(${b.code})`, 20)} ${padW(fmtNum(b.lower), 8)} ${padW(fmtNum(b.upper), 8)} ${padW(px == null ? '—' : px.toFixed(3), 9)}`;
+      console.log(`${head} ${pos}  ${b.enabled ? armed : '停用'} · ${act} · 冷却 ${b.cooldownMin}m`);
+      if (b.note) console.log(`${' '.repeat(5)}${C.d}备注：${b.note}${C.x}`);
+    }
+    const pend = B.pendingAlerts();
+    if (pend.length) {
+      console.log(`\n${C.y}有 ${pend.length} 条待处理告警${C.x}（node cli.js alert poll 查看）`);
+    }
+    return;
+  }
+
+  if (sub === 'set') {
+    const code = rest[1];
+    if (!/^\d{6}$/.test(code || '')) throw new Error('用法：node cli.js band set 512890 --lower 1.225 --upper 1.245 [--action analyze] [--cool 30] [--note "..."]');
+    let name = argv.name && argv.name !== 'true' ? argv.name : '';
+    let type = argv.type && argv.type !== 'true' ? argv.type : '';
+    try {
+      const target = B.secidOf(code, type || 'stock');
+      const d = await api('/api/quotes?secids=' + target);
+      if (d && d[0]) {
+        name = name || d[0].name || '';
+        // 从返回值回填类型：ETF 与股票的下单/止损口径不同，别猜
+        if (!type) type = /^[15]/.test(code) ? 'etf' : 'stock';
+      }
+    } catch {
+      /* 服务没起也能设，只是名称留空 */
+    }
+    const b = B.upsertBand({
+      code,
+      name: name || code,
+      type: type || (/^[15]/.test(code) ? 'etf' : 'stock'),
+      lower: argv.lower != null && argv.lower !== 'true' ? num(argv.lower) : null,
+      upper: argv.upper != null && argv.upper !== 'true' ? num(argv.upper) : null,
+      action: argv.action === 'analyze' ? 'analyze' : 'notify',
+      cooldownMin: argv.cool != null && argv.cool !== 'true' ? num(argv.cool, 30) : 30,
+      resetPct: argv.reset != null && argv.reset !== 'true' ? num(argv.reset, 0.3) : 0.3,
+      note: argv.note && argv.note !== 'true' ? argv.note : '',
+      enabled: argv.off ? false : true,
+    });
+    console.log(`${C.g}✓${C.x} 区间已保存 ${b.id} ${b.name}(${b.code}) ${b.lower ?? '—'} ~ ${b.upper ?? '—'} · ${b.action === 'analyze' ? '自动二次分析' : '仅提醒'}`);
+    if (b.action === 'analyze' && !B.loadConfig().agent.enabled) {
+      console.log(`${C.y}  提示：自动二次分析总开关未打开（node cli.js band agent --on），当前只落盘告警 + 由定时巡检兜底${C.x}`);
+    }
+    return;
+  }
+
+  if (sub === 'del') {
+    const key = rest[1];
+    if (!key) throw new Error('用法：node cli.js band del B01|512890');
+    const cfg = B.loadConfig();
+    const hit = cfg.bands.find((b) => b.id === key || b.code === key);
+    if (!hit) throw new Error(`找不到区间 ${key}`);
+    B.removeBand(hit.id);
+    console.log(`${C.g}✓${C.x} 已删除 ${hit.id} ${hit.name}(${hit.code})`);
+    return;
+  }
+
+  if (sub === 'on' || sub === 'off') {
+    const key = rest[1];
+    if (!key) throw new Error(`用法：node cli.js band ${sub} B01|512890`);
+    const cfg = B.loadConfig();
+    const hit = cfg.bands.find((b) => b.id === key || b.code === key);
+    if (!hit) throw new Error(`找不到区间 ${key}`);
+    const b = B.toggleBand(hit.id, sub === 'on');
+    console.log(`${C.g}✓${C.x} ${b.id} ${b.name} 已${b.enabled ? '启用' : '停用'}`);
+    return;
+  }
+
+  if (sub === 'agent') {
+    const cfg = B.loadConfig();
+    if (argv.on) {
+      cfg.agent.enabled = true;
+      B.saveConfig(cfg);
+      console.log(`${C.g}✓${C.x} 自动二次分析已开启（触发即起分析进程）`);
+    } else if (argv.off) {
+      cfg.agent.enabled = false;
+      B.saveConfig(cfg);
+      console.log(`${C.g}✓${C.x} 自动二次分析已关闭（只落盘告警，由定时巡检兜底）`);
+    }
+    const entry = B.agentEntry(cfg);
+    console.log(`  总开关：${cfg.agent.enabled ? C.g + '开' + C.x : C.y + '关' + C.x}`);
+    console.log(`  CLI 入口：${entry ? entry.entry : C.r + '未找到（可在 data/bands.json 的 agent.entry 指定）' + C.x}`);
+    if (argv.probe) {
+      if (!entry) throw new Error('没有可用 CLI 入口，无法自检');
+      console.log('  自检中（会真实调用一次，约 30-90 秒）…');
+      const r = await probeAgent(entry, cfg);
+      console.log(`  退出码 ${r.code}${r.authFail ? ` ${C.r}· 未登录${C.x}` : r.code === 0 ? ` ${C.g}· 可用${C.x}` : ''}`);
+      const out = (r.text || '').trim().split('\n').slice(-4).join('\n');
+      if (out) console.log(`${C.d}${out}${C.x}`);
+      if (r.authFail) {
+        console.log(`\n${C.y}CLI 需要登录后才能自动发起二次分析。两条路：${C.x}`);
+        console.log('  1) 在终端执行一次 CLI 登录，之后本功能即可用；');
+        console.log('  2) 不登录也行——告警会留在队列里，由「区间巡检」定时任务消费（最迟 20 分钟）。');
+      }
+    }
+    return;
+  }
+
+  if (sub === 'status') {
+    const d = await api('/api/bands');
+    console.log(`监控：${d.live.startAt ? '运行中' : '未启动（服务常驻后自动开启）'} · 轮询 ${d.pollSeconds}s · 已检查 ${d.live.checks} 次`);
+    const lt = d.live.lastCheck ? new Date(d.live.lastCheck) : null;
+    const lts = lt ? `${String(lt.getHours()).padStart(2, '0')}:${String(lt.getMinutes()).padStart(2, '0')}:${String(lt.getSeconds()).padStart(2, '0')}` : '—（非交易时段不取价）';
+    console.log(`上次检查：${lts} · 上次触发：${d.live.lastFire ? B.alertText(d.live.lastFire) : '—'}`);
+    console.log(`分析进程：${d.live.agentRunning ? '跑着' : '空闲'} · 待处理告警 ${d.alerts.length} 条`);
+    if (d.live.lastError) console.log(`${C.r}最近错误：${d.live.lastError}${C.x}`);
+    return;
+  }
+
+  throw new Error('用法：node cli.js band list|set|del|on|off|agent|status');
+}
+
+function probeAgent(entry, cfg) {
+  return new Promise((resolve) => {
+    const port = 51000 + Math.floor(Math.random() * 900);
+    const child = spawn(process.execPath, [entry.entry, '-p', '只输出两个字：收到', '-y', '--no-session-persistence', '--port', String(port)], {
+      cwd: ROOT,
+      env: { ...process.env, NO_OPEN: '1' },
+    });
+    let text = '';
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* 已退出 */ } }, 120000);
+    child.stdout.on('data', (d) => (text += d.toString()));
+    child.stderr.on('data', (d) => (text += d.toString()));
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve({ code, text, authFail: /Authentication required|请先登录|not logged in/i.test(text) });
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ code: -1, text: e.message, authFail: false });
+    });
+  });
+}
+
+// ---------------- 告警队列 ----------------
+async function cmdAlert(rest, argv) {
+  const sub = rest[0] || 'poll';
+  if (sub === 'poll') {
+    // --check：先补一次区间判定（盯盘台没常驻时也能抓到现在的位置）
+    if (argv.check) {
+      try {
+        await ensureServer();
+        const r = await api('/api/bands', { method: 'POST', body: { action: 'check' } });
+        if (r.fired && r.fired.length) {
+          console.log(
+            `新触发 ${r.fired.length} 条：` +
+              r.fired
+                .map((f) => `${f.name}(${f.code}) ${f.side === 'upper' ? '上破' : '下破'} ${f.price}`)
+                .join('；')
+          );
+        }
+      } catch (e) {
+        console.log(`（区间检查跳过：${e.message}）`);
+      }
+    }
+    const pend = B.pendingAlerts(argv.date && argv.date !== 'true' ? argv.date : undefined);
+    if (!pend.length) {
+      // 快路径：无事可做时只输出一行，供定时任务尽早收工
+      console.log('IDLE');
+      return;
+    }
+    console.log(`PENDING ${pend.length}`);
+    for (const it of pend) {
+      console.log(
+        `${it.id} ${it.tradeDate} ${it.time} ${it.name}(${it.code}) ${it.side === 'upper' ? '上破' : '下破'} ` +
+          `${it.side === 'upper' ? it.upper : it.lower} · 现价 ${it.price} · 动作 ${it.action}${it.bandNote ? ' · 备注 ' + it.bandNote : ''}`
+      );
+    }
+    return;
+  }
+  if (sub === 'list') {
+    const a = B.loadAlerts();
+    if (!a.items.length) {
+      console.log('还没有触发记录');
+      return;
+    }
+    for (const it of a.items.slice(0, num(argv.limit, 20))) {
+      const tag = it.status === 'pending' ? `${C.y}待处理${C.x}` : `${C.d}${it.status}${C.x}`;
+      console.log(`${it.id} ${it.tradeDate} ${it.time} ${tag} ${B.alertText(it)}${it.result ? ` · ${it.result}` : ''}`);
+    }
+    return;
+  }
+  if (sub === 'ack') {
+    const id = rest[1];
+    if (!id) throw new Error('用法：node cli.js alert ack A0001 --note "结论"');
+    const note = argv.note && argv.note !== 'true' ? argv.note : rest.slice(2).join(' ');
+    const it = B.ackAlert(id, { by: argv.by && argv.by !== 'true' ? argv.by : '手动', note });
+    console.log(`${C.g}✓${C.x} ${it.id} 已标记处理${it.result ? `：${it.result}` : ''}`);
+    return;
+  }
+  throw new Error('用法：node cli.js alert poll|list|ack');
+}
+
 // ---------------- 入口 ----------------
 function parseArgs(argv) {
   const out = { _: [] };
@@ -606,11 +861,16 @@ async function main() {
   const [cmd, ...rest] = argv._;
   try {
     // note / journal 是纯文件操作，不能因服务没起就写不进日志；只有 journal sync 需要服务
-    const needServer = cmd && cmd !== 'note' && !(cmd === 'journal' && rest[0] !== 'sync');
+    // note / alert / band（除 status 外）都是纯文件操作，不能因服务没起就写不进去
+    const fileOnly =
+      cmd === 'note' || cmd === 'alert' || (cmd === 'band' && rest[0] !== 'status');
+    const needServer = cmd && !fileOnly && !(cmd === 'journal' && rest[0] !== 'sync');
     if (needServer) await ensureServer();
     switch (cmd) {
       case 'status': await cmdStatus(); break;
       case 'risk': await cmdRisk(); break;
+      case 'band': await cmdBand(rest, argv); break;
+      case 'alert': await cmdAlert(rest, argv); break;
       case 'scan': await cmdScan(argv); break;
       case 'quote':
         if (!rest.length) throw new Error('用法：node cli.js quote 600519 300750');

@@ -9,6 +9,12 @@ data/state.json
 data/state.json.tmp
 data/*.log
 
+# ---- 区间触发运行时状态 ----
+# bands.json 是配置（入库）；下面两个是每个交易日都在变的运行态，不入库。
+data/bands.state.json
+data/alerts.json
+data/agent-runs/
+
 # ---- WorkBuddy 运行时数据（记忆、自动化快照）----
 .workbuddy/
 
