@@ -53,7 +53,7 @@
 ## 快速开始
 
 ```bash
-node server.js          # 起服务，默认 http://127.0.0.1:5173
+node server.js          # 起服务，默认 http://127.0.0.1:5193
 ```
 
 Windows 下双击 `start.bat` 亦可。首次启动会自动创建账户（`data/state.json`），默认本金 100 万；想要 5 万：

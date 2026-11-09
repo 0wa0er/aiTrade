@@ -51,7 +51,7 @@ function loadAccountPermissions() {
   }
 }
 
-const PORT = Number(process.env.PORT || 5173);
+const PORT = Number(process.env.PORT || 5193);
 const HOST = process.env.HOST || '127.0.0.1';
 // 非交易时段是否允许下单（默认拦截；设 SIM_ALLOW_OFFHOURS=1 放开，仅供复盘演练）
 const ALLOW_OFF_HOURS = process.env.SIM_ALLOW_OFFHOURS === '1';
@@ -2087,7 +2087,7 @@ if (matchTimer.unref) matchTimer.unref();
 
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
-    const url = `http://localhost:${PORT}`;
+    const url = `http://${HOST}:${PORT}`;
     console.log(`\n  盯盘交易台（真实规则版）已启动  →  ${url}`);
     console.log(`  监听 ${HOST}:${PORT} · ${sessionState().label} · 交易日 ${tradingDateKey()}`);
     console.log(

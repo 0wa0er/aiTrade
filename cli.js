@@ -44,7 +44,8 @@ const B = require('./core/bands');
 
 const ROOT = __dirname;
 const DATA = path.join(ROOT, 'data');
-const BASE = process.env.TD_BASE || 'http://127.0.0.1:5173';
+const PORT = Number(process.env.PORT || 5193);
+const BASE = process.env.TD_BASE || `http://127.0.0.1:${PORT}`;
 
 const C = {
   r: '\x1b[31m', g: '\x1b[32m', y: '\x1b[33m', c: '\x1b[36m',
@@ -141,7 +142,7 @@ async function ensureServer() {
       return true;
     }
   }
-  const err = new Error('交易服务启动失败（端口 5173 可能被占用，或 node 不可用）');
+  const err = new Error(`交易服务启动失败（端口 ${PORT} 可能被占用，或 node 不可用）`);
   err.code = 'DOWN';
   throw err;
 }
