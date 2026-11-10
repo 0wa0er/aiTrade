@@ -1603,6 +1603,9 @@ async function buildDashboard() {
     meta: {
       serverTime: Date.now(),
       serverClock: fmtTime(),
+      // serverDate 是真实日历日；tradingDate 是「归属交易日」（09:15 前算上一交易日）。
+      // 两者在盘前会差一天，别把 tradingDate 当时钟用——显示层要分开写。
+      serverDate: fmtDate(),
       tradingDate: todayKey,
       session: sess,
       quoteTime: quoteTime || null,

@@ -309,7 +309,13 @@ async function cmdStatus() {
   const a = dash.account;
   const ctx = riskContext(cfg, dash);
 
-  console.log(`${C.b}时间${C.x} ${dash.meta.tradingDate} ${dash.meta.serverClock}　${C.b}时段${C.x} ${s.label}（${s.code}）　可委托=${s.accept ? C.g + '是' : C.y + '否'}${C.x}　可撤单=${s.cancelable ? '是' : '否'}`);
+  // 盘前（09:15 前）tradingDate 会落到上一交易日，跟真实日期差一天，
+  // 两者混着显示会让人误判今天是几号，所以分开写。
+  const realDate = dash.meta.serverDate || dash.meta.tradingDate;
+  const tdNote = dash.meta.tradingDate && dash.meta.tradingDate !== realDate
+    ? `　${C.b}归属交易日${C.x} ${dash.meta.tradingDate}`
+    : '';
+  console.log(`${C.b}时间${C.x} ${realDate} ${dash.meta.serverClock}${tdNote}　${C.b}时段${C.x} ${s.label}（${s.code}）　可委托=${s.accept ? C.g + '是' : C.y + '否'}${C.x}　可撤单=${s.cancelable ? '是' : '否'}`);
   console.log(
     `${C.b}资产${C.x} 总 ${money(a.totalAsset)}　可用 ${money(a.cash)}　冻结 ${money(a.frozenCash)}　` +
       `市值 ${money(a.marketValue)}　当日 ${signColor(a.dayPnl)}${money(a.dayPnl)} (${pct(a.dayPnlPct)})${C.x}　` +
