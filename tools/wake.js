@@ -220,6 +220,8 @@ function tPlan() {
 
 function tOpen() {
   const steps = [];
+  const liveFix = ensureLive('09:45');
+  if (liveFix) steps.push(liveFix);
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   const risk = cli(['risk']);
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
@@ -241,6 +243,8 @@ function tOpen() {
 
 function tMidday() {
   const steps = [];
+  const liveFix = ensureLive('11:25');
+  if (liveFix) steps.push(liveFix);
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   const risk = cli(['risk']);
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
@@ -250,6 +254,8 @@ function tMidday() {
 
 function tTail() {
   const steps = [];
+  const liveFix = ensureLive('14:40');
+  if (liveFix) steps.push(liveFix);
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   steps.push(`risk: ${cli(['risk']).out.split('\n')[0]}`);
   steps.push(`orders: ${cli(['orders']).out.split('\n')[0]}`);
@@ -266,6 +272,29 @@ function tClose() {
   steps.push(`alert: ${cli(['alert', 'poll']).out.split('\n')[0]}`);
   cli(['note', '--tag', '运维', '[系统任务] 15:15 收盘归档：账户快照已同步、观察池已清理、索引已重建。复盘内容需另行补写']);
   return steps;
+}
+
+/**
+ * 盯盘进程存活自检：不在就拉起来。
+ * 盯盘进程是止损止盈的唯一执行者——条件单还有 cond check 兜底，风控信号没有。
+ * 它中途崩了（被系统回收 / 休眠唤醒失败 / 自己异常退出），09:45 之后的三个窗口
+ * 原本都发现不了，一直到收盘才从「今天怎么没信号」里看出来。
+ *
+ * @returns {string|null} 需要说明时返回一行文字，正常存活返回 null（不占日志）
+ */
+function ensureLive(tag) {
+  const status = cli(['live', 'status']);
+  const alive = /运行中|PID/.test(status.out) && !/未启动/.test(status.out);
+  if (alive) return null;
+  const child = spawn(process.execPath, [path.join(ROOT, 'tools', 'live.js')], {
+    cwd: ROOT,
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, NO_OPEN: '1' },
+  });
+  child.unref();
+  logLine(`[${tag}] 盯盘未在运行，已重新拉起 PID ${child.pid}`);
+  return `live 重启 PID ${child.pid}`;
 }
 
 function tLiveOn() {
