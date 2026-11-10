@@ -75,10 +75,14 @@ const DATA = path.join(ROOT, 'data');
 const PORT = Number(process.env.PORT || 5193);
 const BASE = process.env.TD_BASE || `http://127.0.0.1:${PORT}`;
 
-const C = {
-  r: '\x1b[31m', g: '\x1b[32m', y: '\x1b[33m', c: '\x1b[36m',
-  b: '\x1b[1m', d: '\x1b[2m', x: '\x1b[0m',
-};
+// NO_COLOR=1 时全空：系统任务要把 CLI 输出原样写进日志/参数卡，不能带 ANSI 码
+const NO_COLOR = !!process.env.NO_COLOR;
+const C = NO_COLOR
+  ? { r: '', g: '', y: '', c: '', b: '', d: '', x: '' }
+  : {
+      r: '\x1b[31m', g: '\x1b[32m', y: '\x1b[33m', c: '\x1b[36m',
+      b: '\x1b[1m', d: '\x1b[2m', x: '\x1b[0m',
+    };
 
 // ---------------- 基础 ----------------
 function loadCfg() {
@@ -386,10 +390,41 @@ async function cmdRisk() {
   console.log(hit ? `\n${hit} 只持仓存在需要处理的信号` : '\n无买卖信号');
 }
 
+/**
+ * 在「单笔 ≥ minAmt」与「单票 ≤ maxAmt」之间能建仓的最大整手股数。
+ * null 表示结构性买不了：最小合规手数已超单票上限（一手不够最低单笔时也一样）。
+ * 例：84.57 元的票，100 股 8,457 不到 1 万，200 股 16,914 又超 15,000，等于无法建仓——
+ * 这种票扫出来再多看都是浪费时间，必须在候选阶段就标掉。
+ */
+function feasibleQty(price, minAmt, maxAmt) {
+  if (!(price > 0)) return null;
+  const maxLots = Math.floor(maxAmt / (price * 100));
+  const minLots = Math.ceil(minAmt / (price * 100));
+  if (maxLots < 1 || minLots > maxLots) return null;
+  return maxLots * 100;
+}
+
 async function cmdScan(argv) {
   const cfg = loadCfg();
   const sc = cfg.scan || {};
   const limit = num(argv.limit, 12);
+  const fresh = argv.fresh === 'true' || argv.fresh === true;
+
+  // 金额闸门用实时权益算；服务没起就退化，只显示一手金额，不阻断扫描
+  let ctx = null;
+  const held = new Set();
+  const watched = new Set();
+  try {
+    const dash = await api('/api/dashboard');
+    ctx = riskContext(cfg, dash);
+    for (const p of dash.positions || []) if (num(p.qty) > 0) held.add(String(p.code));
+  } catch {
+    /* 无服务：跳过可买判定 */
+  }
+  if (fresh) {
+    for (const w of loadState().watchlist || []) watched.add(String(w.code));
+  }
+
   const pz = 200;
   const fields = 'f2,f3,f5,f6,f8,f9,f12,f14,f20';
   const url =
@@ -412,18 +447,36 @@ async function cmdScan(argv) {
     const [lo, hi] = sc.pctRange || [-4, 6];
     if (p < lo || p > hi) return false;
     if (amount < num(sc.minAmountYi, 2) * 1e8) return false;
+    // 池外选股：已在观察池或已持仓的不再重复推
+    if (fresh && (held.has(code) || watched.has(code))) return false;
     return true;
   });
 
   const boards = R.allowedBoards(cfg.account?.permissions).join('、');
-  console.log(`${C.b}候选池${C.x}（成交额前列，价 ${sc.minPrice}–${sc.maxPrice}，涨幅 ${(sc.pctRange || []).join('%~')}%，成交额 ≥${sc.minAmountYi} 亿）`);
-  console.log(`${C.d}可交易范围：${boards}　｜　价格区间保证一手 ≤ ${money(num(sc.maxPrice) * 100)}${C.x}`);
+  console.log(
+    `${C.b}${fresh ? '池外候选' : '候选池'}${C.x}（成交额前列，价 ${sc.minPrice}–${sc.maxPrice}，` +
+      `涨幅 ${(sc.pctRange || []).join('%~')}%，成交额 ≥${sc.minAmountYi} 亿${fresh ? '，已排除持仓与观察池' : ''}）`
+  );
+  console.log(
+    `${C.d}可交易范围：${boards}` +
+      (ctx ? `　｜　单笔 ≥ ${money(ctx.minTradeAmount)}，单票 ≤ ${money(ctx.maxSingleValue)}；「✗」=结构性买不了` : '') +
+      C.x
+  );
+  let blocked = 0;
   list.slice(0, limit).forEach((d, i) => {
+    const price = num(d.f2);
+    const qty = ctx ? feasibleQty(price, ctx.minTradeAmount, ctx.maxSingleValue) : null;
+    if (ctx && !qty) blocked += 1;
+    const able = ctx ? (qty ? `${qty}股` : `${C.y}✗${C.x}`) : '--';
     console.log(
-      `${String(i + 1).padStart(2)}. ${d.f12} ${String(d.f14).padEnd(6)}　价 ${String(num(d.f2).toFixed(2)).padStart(7)}　` +
-        `涨 ${signColor(d.f3)}${pct(d.f3)}${C.x}　成交 ${(num(d.f6) / 1e8).toFixed(1)}亿　换手 ${num(d.f8).toFixed(1)}%　PE ${num(d.f9) ? num(d.f9).toFixed(1) : '--'}`
+      `${String(i + 1).padStart(2)}. ${d.f12} ${String(d.f14).padEnd(6)}　价 ${String(price.toFixed(2)).padStart(7)}　` +
+        `涨 ${signColor(d.f3)}${pct(d.f3)}${C.x}　成交 ${(num(d.f6) / 1e8).toFixed(1)}亿　换手 ${num(d.f8).toFixed(1)}%　` +
+        `PE ${num(d.f9) ? num(d.f9).toFixed(1) : '--'}　一手 ${Math.round(price * 100).toLocaleString('zh-CN')}　可买 ${able}`
     );
   });
+  if (ctx && blocked) {
+    console.log(`${C.d}其中 ${blocked} 只结构性买不了（凑不到「单笔下限以上、单票上限以下」的整手），不必再评估${C.x}`);
+  }
   if (!list.length) console.log('无符合条件标的（可能是极端行情），本时段不动');
 }
 

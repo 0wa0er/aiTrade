@@ -1,6 +1,6 @@
 {
   "name": "trade-desk",
-  "version": "2.6.2",
+  "version": "2.6.3",
   "private": true,
   "description": "本地实时盯盘 + 模拟交易台（股票/基金），零依赖",
   "main": "server.js",

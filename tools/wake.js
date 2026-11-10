@@ -74,7 +74,7 @@ function cli(args, opts = {}) {
     cwd: ROOT,
     encoding: 'utf8',
     timeout: opts.timeout || 60000,
-    env: { ...process.env, NO_OPEN: '1' },
+    env: { ...process.env, NO_OPEN: '1', NO_COLOR: '1' },
   });
   return { ok: r.status === 0, out: `${r.stdout || ''}${r.stderr || ''}`.trim() };
 }
@@ -96,7 +96,7 @@ async function ensureServer() {
       cwd: ROOT,
       detached: true,
       stdio: 'ignore',
-      env: { ...process.env, NO_OPEN: '1' },
+      env: { ...process.env, NO_OPEN: '1', NO_COLOR: '1' },
     });
     child.unref();
     for (let i = 0; i < 30; i += 1) {
@@ -176,8 +176,18 @@ function tPlan() {
   steps.push(`prune: ${prune.out.split('\n')[0]}`);
 
   const wl = cli(['watch', 'list']);
-  const codes = [...wl.out.matchAll(/^(\d{6})\s/gm)].map((m) => m[1]);
+  const wlCodes = [...wl.out.matchAll(/^(\d{6})\s/gm)].map((m) => m[1]);
+  // 持仓标的必须有指标：它们是唯一会产生实际盈亏的东西。
+  // 已建仓的票会被 prune 移出观察池，只按池子取数会把唯一持仓漏掉。
+  const holdSeg = (dash.out.split(/持仓\s+\d+\/\d+/)[1] || '').split(/挂单/)[0];
+  const posCodes = [...holdSeg.matchAll(/^\s*(\d{6})\s/mg)].map((m) => m[1]);
+  const codes = [...new Set([...posCodes, ...wlCodes])];
   const ind = indicators(codes.length ? codes : []);
+
+  // 池外候选：机械扫描，只过硬闸门，不做推荐。
+  // 入池要判断，判断归客户端（08:50 那条自动化），这里只提供原料。
+  const fresh = cli(['scan', '--limit', '10', '--fresh'], { timeout: 90000 });
+  steps.push(`scan: ${fresh.out.split('\n')[0]}`);
 
   const planBody = [
     `### 盘前参数卡（${stamp()} 自动生成）`,
@@ -185,7 +195,7 @@ function tPlan() {
     '> 本节由系统任务 `wake.js plan` 生成：只放**实测参数与硬规则**，不含主观判断。',
     '> 逐条判据、情景归属、下单决策仍需在 08:45~09:45 之间由人或 agent 补写。',
     '',
-    '**技术指标（本轮现取，禁止沿用旧值）**',
+    '**技术指标（本轮现取，禁止沿用旧值；含持仓与观察池）**',
     '',
     '| 标的 | 收盘 | MA5 | MA10 | MA20 | BOLL 下/中/上 | MACD | RSI6 |',
     '|---|---|---|---|---|---|---|---|',
@@ -209,12 +219,22 @@ function tPlan() {
     '| 均不成立 | — | 不下单，记录实测值 |',
     '',
     '**判据时点**：一律用「本次任务运行时刻」，禁止写运行之前的时点。',
+    '',
+    `### 池外候选（${stamp()} 机械扫描，未入池）`,
+    '',
+    '> 只过硬闸门（板块权限 / 价格 / 涨跌幅 / 成交额 / 能否凑出合规整手），**不含任何推荐**。',
+    '> 评估后值得跟踪的再入池：`node cli.js watch add <代码> --note "价位 + 信号" --source plan --ttl 5`。',
+    '> 「可买 ✗」= 凑不出「≥ 单笔下限 且 ≤ 单票上限」的整手，结构性建不了仓，跳过。',
+    '',
+    '```',
+    fresh.out.trim(),
+    '```',
   ].join('\n');
 
   const write = cli(['journal', 'plan', planBody]);
   steps.push(`plan: ${write.out.split('\n')[0]}`);
 
-  cli(['note', '--tag', '计划', `盘前参数卡已生成（观察池 ${codes.length} 只，指标${ind ? '现取成功' : '取数失败'}），主观判断待客户端 agent 补写`]);
+  cli(['note', '--tag', '计划', `盘前参数卡已生成（持仓+观察池 ${codes.length} 只，指标${ind ? '现取成功' : '取数失败'}），主观判断待客户端 agent 补写`]);
   return steps;
 }
 
@@ -291,7 +311,7 @@ function ensureLive(tag) {
     cwd: ROOT,
     detached: true,
     stdio: 'ignore',
-    env: { ...process.env, NO_OPEN: '1' },
+    env: { ...process.env, NO_OPEN: '1', NO_COLOR: '1' },
   });
   child.unref();
   logLine(`[${tag}] 盯盘未在运行，已重新拉起 PID ${child.pid}${AUTO ? '（止损自动）' : '（仅告警）'}`);
@@ -305,7 +325,7 @@ function tLiveOn() {
     cwd: ROOT,
     detached: true,
     stdio: 'ignore',
-    env: { ...process.env, NO_OPEN: '1' },
+    env: { ...process.env, NO_OPEN: '1', NO_COLOR: '1' },
   });
   child.unref();
   logLine(`盯盘进程已拉起（PID ${child.pid}${AUTO ? '，止损自动执行' : '，仅告警'}）`);
