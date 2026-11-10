@@ -1501,7 +1501,7 @@ async function cmdTake(rest, argv = {}) {
             side: 'sell',
             qty: null, // 留空 = 全部可卖，避免 T+1 部分解禁时因数量不符被拒
             price: d.price,
-            op: '>=',
+            op: T.TAKE_OP, // '<=' —— 跌到止盈价才卖；写成 '>=' 会建单即成交
             window: { from: '09:30', to: '14:57' },
             expireOn,
             note:
@@ -1520,7 +1520,7 @@ async function cmdTake(rest, argv = {}) {
         const item = K.revise(
           existing.id,
           {
-            triggers: { price: { op: '>=', value: d.price } },
+            triggers: { price: { op: T.TAKE_OP, value: d.price } },
             expireOn,
             why: `持仓期最高 ${t.high} 抬升 → 锁定 +${t.lockPct}%`,
           },

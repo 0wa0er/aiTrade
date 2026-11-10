@@ -222,4 +222,31 @@ ok('revise 不接受改标的（改方向等于换单，应撤了重下）', () 
   assert.strictEqual(next.code, '600002');
 });
 
+console.log('移动止盈 · 触发方向（最容易写反，写反就变成持仓即卖）');
+
+const mkTake = (op, value = 1.31) =>
+  K.normalize(
+    { code: '512890', name: '红利低波ETF', side: 'sell', qty: null, price: value, op, note: '移动止盈', source: 'take' },
+    { today: '2026-11-10' }
+  );
+const at = (price) => ({ hhmm: '10:00', today: '2026-11-10', price });
+
+ok('TAKE_OP 必须是 <=（跌到止盈价才卖）', () => {
+  assert.strictEqual(T.TAKE_OP, '<=');
+});
+
+ok('用 <=：价格在止盈价之上不触发，跌到才触发', () => {
+  const it = mkTake(T.TAKE_OP);
+  assert.strictEqual(it.triggers.price.op, '<=');
+  assert.strictEqual(K.evaluate(it, at(1.35)).fire, false, '还没跌到止盈价就卖了');
+  assert.strictEqual(K.evaluate(it, at(1.31)).fire, true);
+  assert.strictEqual(K.evaluate(it, at(1.28)).fire, true, '跌穿也该卖（跳空）');
+});
+
+ok('误用 >= 会在建单瞬间成交 —— 这就是为什么方向必须集中在一个常量里', () => {
+  const bad = mkTake('>=');
+  // 建单时现价 1.35 恒高于 target 1.31（target = 最高价×(1-回撤)），条件立即成立
+  assert.strictEqual(K.evaluate(bad, at(1.35)).fire, true);
+});
+
 console.log(`\n移动止盈：${pass} 项通过${process.exitCode ? '，有失败' : ''}`);

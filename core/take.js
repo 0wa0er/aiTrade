@@ -34,6 +34,15 @@ const DEFAULT_ATR_PCT = 2.5; // 取不到 ATR 时的保守默认
 const ATR_N = 14;
 
 /**
+ * 止盈条件单的比较方向：**`<=`**（价格跌到止盈价才卖）。
+ *
+ * 这一条极易写反成 `>=`。`>=` 是「涨到目标价卖」（固定目标止盈）的语义；
+ * 移动止盈的 target 恒低于持仓期最高价，建单时现价必然 ≥ target，
+ * 若写成 `>=`，下一轮 `cond check` 会立刻成交——把止盈变成「持仓即卖」。
+ */
+const TAKE_OP = '<=';
+
+/**
  * 从日线算 ATR 占现价的百分比。
  * @param {Array<{high,low,close}>} klines 升序或降序均可，内部取最后 N 根
  * @returns {number} 例如 1.39 表示 ATR14 = 现价的 1.39%
@@ -211,6 +220,7 @@ function describe(t) {
 
 module.exports = {
   ATR_N,
+  TAKE_OP,
   PULL_ATR_K,
   PULL_MIN,
   PULL_MAX,
