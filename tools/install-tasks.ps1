@@ -30,7 +30,7 @@ $AutoArg = if ($AutoSell) { ' --auto' } else { '' }
 
 $Tasks = @(
   @{ Name = '盘前计划';   At = '08:45'; Args = "plan$AgentArg";        Desc = '盘前计划：参数卡 + 观察池同步（不交易）' },
-  @{ Name = '盯盘启动';   At = '09:20'; Args = 'live-on';              Desc = '启动常驻实时盯盘进程' },
+  @{ Name = '盯盘启动';   At = '09:20'; Args = "live-on$AutoArg";        Desc = '启动常驻实时盯盘进程（-AutoSell 时止损自动执行）' },
   @{ Name = '开盘执行';   At = '09:45'; Args = "open$AgentArg$AutoArg"; Desc = '开盘执行窗口：处理告警与风控' },
   @{ Name = '午间检视';   At = '11:25'; Args = "midday$AgentArg$AutoArg"; Desc = '午间持仓检视（只卖不买）' },
   @{ Name = '尾盘调仓';   At = '14:40'; Args = "tail$AgentArg$AutoArg"; Desc = '尾盘调仓窗口' },

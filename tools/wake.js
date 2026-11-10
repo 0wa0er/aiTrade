@@ -227,9 +227,10 @@ function tOpen() {
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
 
   let sold = 0;
-  const hits = [...risk.out.matchAll(/止损|止盈/g)].length;
+  // 只认「止损」信号；止盈（减半）留给人工判断——急涨中自动卖容易卖飞。
+  const hits = [...risk.out.matchAll(/止损/g)].length;
   if (hits && AUTO) {
-    const sells = [...risk.out.matchAll(/^.*?(止损|止盈).*?(\d{6})\D+(\d+)/gm)];
+    const sells = [...risk.out.matchAll(/^.*?止损.*?(\d{6})\D+(\d+)/gm)];
     for (const m of sells) {
       const r = cli(['sell', m[2], m[3]]);
       sold += r.ok ? 1 : 0;
@@ -237,7 +238,7 @@ function tOpen() {
     }
   }
   const dash = cli(['status']);
-  cli(['note', '--tag', '记录', `[系统任务] 09:45 开盘窗口：${steps.join('；')}${hits ? `；风控信号 ${hits} 条${AUTO ? `，自动卖出 ${sold} 笔` : '（未开 --auto，仅告警）'}` : '；无风控信号'}；${dash.out.split('\n')[0]}`]);
+  cli(['note', '--tag', '记录', `[系统任务] 09:45 开盘窗口：${steps.join('；')}${hits ? `；止损信号 ${hits} 条${AUTO ? `，自动卖出 ${sold} 笔` : '（未开 --auto，仅告警）'}` : '；无止损信号'}；${dash.out.split('\n')[0]}`]);
   return steps;
 }
 
@@ -286,29 +287,29 @@ function ensureLive(tag) {
   const status = cli(['live', 'status']);
   const alive = /运行中|PID/.test(status.out) && !/未启动/.test(status.out);
   if (alive) return null;
-  const child = spawn(process.execPath, [path.join(ROOT, 'tools', 'live.js')], {
+  const child = spawn(process.execPath, [path.join(ROOT, 'tools', 'live.js'), ...(AUTO ? ['--auto'] : [])], {
     cwd: ROOT,
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, NO_OPEN: '1' },
   });
   child.unref();
-  logLine(`[${tag}] 盯盘未在运行，已重新拉起 PID ${child.pid}`);
+  logLine(`[${tag}] 盯盘未在运行，已重新拉起 PID ${child.pid}${AUTO ? '（止损自动）' : '（仅告警）'}`);
   return `live 重启 PID ${child.pid}`;
 }
 
 function tLiveOn() {
   const status = cli(['live', 'status']);
   if (/运行中|PID/.test(status.out) && !/未启动/.test(status.out)) return [`已在运行：${status.out.split('\n')[0]}`];
-  const child = spawn(process.execPath, [path.join(ROOT, 'tools', 'live.js')], {
+  const child = spawn(process.execPath, [path.join(ROOT, 'tools', 'live.js'), ...(AUTO ? ['--auto'] : [])], {
     cwd: ROOT,
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, NO_OPEN: '1' },
   });
   child.unref();
-  logLine(`盯盘进程已拉起（PID ${child.pid}）`);
-  return [`live 已拉起 PID ${child.pid}`];
+  logLine(`盯盘进程已拉起（PID ${child.pid}${AUTO ? '，止损自动执行' : '，仅告警'}）`);
+  return [`live 已拉起 PID ${child.pid}${AUTO ? ' --auto' : ''}`];
 }
 
 function tLiveOff() {

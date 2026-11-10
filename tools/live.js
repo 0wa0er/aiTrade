@@ -287,7 +287,11 @@ async function tick() {
     S._sigSeen[key] = true;
     event(sig.type, sig.text, { code: sig.code, severity: sig.severity });
 
-    if (AUTO && tradable) {
+    // --auto 只执行硬止损（-7% 红线）。另外两类刻意不给自动化：
+    //   take（止盈）：收益优化，急涨中自动卖容易卖飞，留给人判断；
+    //   structure（弱于大盘 2 倍）：幅度可能只有 -2%，自动清仓过于激进。
+    const autoExec = AUTO && tradable && sig.type === 'stop';
+    if (autoExec) {
       const r = await cliSell(sig.code, sig.qty);
       event('exec', `已执行卖出 ${sig.code} ${sig.qty}：${r.ok ? '成功' : '失败'}`, { out: r.out });
       J.appendTimeline({
@@ -295,7 +299,12 @@ async function tick() {
         text: `[盯盘·自动] ${sig.text}；已下单卖出 ${sig.qty}，${r.ok ? '成交' : '失败：' + r.out.slice(0, 80)}`,
       });
     } else {
-      J.appendTimeline({ tag: '风控', text: `[盯盘] ${sig.text}（${AUTO ? '不可委托时段，未下单' : '仅告警，未自动下单'}）` });
+      const why = !AUTO
+        ? '仅告警，未自动下单'
+        : !tradable
+          ? '不可委托时段，未下单'
+          : `仅告警（--auto 只执行止损，${sig.type === 'take' ? '止盈' : '结构'}信号留给人工）`;
+      J.appendTimeline({ tag: '风控', text: `[盯盘] ${sig.text}（${why}）` });
     }
   }
 }
