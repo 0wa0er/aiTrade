@@ -261,22 +261,19 @@ function tOpen() {
   const liveFix = ensureLive('09:45');
   if (liveFix) steps.push(liveFix);
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
-  const risk = cli(['risk']);
-  steps.push(`risk: ${risk.out.split('\n')[0]}`);
+  steps.push(`risk: ${cli(['risk']).out.split('\n')[0]}`);
 
-  let sold = 0;
-  // 只认「止损」信号；止盈（减半）留给人工判断——急涨中自动卖容易卖飞。
-  const hits = [...risk.out.matchAll(/止损/g)].length;
-  if (hits && AUTO) {
-    const sells = [...risk.out.matchAll(/^.*?止损.*?(\d{6})\D+(\d+)/gm)];
-    for (const m of sells) {
-      const r = cli(['sell', m[2], m[3]]);
-      sold += r.ok ? 1 : 0;
-      steps.push(`sell ${m[2]} ${m[3]}: ${r.ok ? '成交' : '失败'}`);
-    }
-  }
+  // 只认 -7% 硬止损；止盈（减半）留给人工——急涨中自动卖容易卖飞。
+  const sweep = stopSweep('09:45');
+  if (sweep) steps.push(sweep);
+
   const dash = cli(['status']);
-  cli(['note', '--tag', '记录', `[系统任务] 09:45 开盘窗口：${steps.join('；')}${hits ? `；止损信号 ${hits} 条${AUTO ? `，自动卖出 ${sold} 笔` : '（未开 --auto，仅告警）'}` : '；无止损信号'}；${dash.out.split('\n')[0]}`]);
+  cli([
+    'note',
+    '--tag',
+    '记录',
+    `[系统任务] 09:45 开盘窗口：${steps.join('；')}${sweep ? '' : '；无止损信号'}；${dash.out.split('\n')[0]}`,
+  ]);
   return steps;
 }
 
@@ -287,7 +284,9 @@ function tMidday() {
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   const risk = cli(['risk']);
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
-  cli(['note', '--tag', '记录', `[系统任务] 11:25 午间检视：${risk.out.split('\n')[0]}（只卖不买，无动作则不写冗余记录）`]);
+  const sweep = stopSweep('11:25');
+  if (sweep) steps.push(sweep);
+  cli(['note', '--tag', '记录', `[系统任务] 11:25 午间检视：${risk.out.split('\n')[0]}${sweep ? `；${sweep}` : '；无止损信号'}（只卖不买）`]);
   return steps;
 }
 
@@ -298,8 +297,15 @@ function tTail() {
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   steps.push(`risk: ${cli(['risk']).out.split('\n')[0]}`);
   steps.push(`orders: ${cli(['orders']).out.split('\n')[0]}`);
+  const sweep = stopSweep('14:40');
+  if (sweep) steps.push(sweep);
   const dash = cli(['status']);
-  cli(['note', '--tag', '记录', `[系统任务] 14:40 尾盘窗口：${dash.out.split('\n')[0]}；持仓与挂单已检视`]);
+  cli([
+    'note',
+    '--tag',
+    '记录',
+    `[系统任务] 14:40 尾盘窗口：${dash.out.split('\n')[0]}；持仓与挂单已检视${sweep ? `；${sweep}` : ''}`,
+  ]);
   return steps;
 }
 
@@ -334,6 +340,56 @@ function ensureLive(tag) {
   child.unref();
   logLine(`[${tag}] 盯盘未在运行，已重新拉起 PID ${child.pid}${AUTO ? '（止损自动）' : '（仅告警）'}`);
   return `live 重启 PID ${child.pid}`;
+}
+
+/**
+ * 止损兜底扫描。
+ *
+ * 盯盘进程是止损的唯一实时执行者（20s 一轮）。它若静默崩掉，止损这条线就断了——
+ * 三个可委托窗口各扫一次补位。只认 -7% 硬止损，止盈与结构信号一律留给人工。
+ *
+ * 为什么改用 risk --json 而不是解析文本：risk 每行都固定含「止损线」三个字，
+ * 早先按 /止损/ 计数，只要有持仓就 >=1，把「有持仓」误报成「有信号」；
+ * 而提取数量的正则要求「止损」之后紧跟 6 位数字，实际永远匹配不到。
+ * 结果是既写假警、又从不真的下单——兜底是假的。
+ */
+function stopSweep(tag) {
+  const raw = cli(['risk', '--json']);
+  let d;
+  try {
+    // 冷启动时 cli.js 会先打「服务未响应，自动启动…」，不能直接 JSON.parse 整段
+    const s = raw.out.indexOf('{');
+    const e = raw.out.lastIndexOf('}');
+    if (s < 0 || e <= s) throw new Error('无 JSON 段');
+    d = JSON.parse(raw.out.slice(s, e + 1));
+  } catch (err) {
+    return `止损兜底(${tag})：risk 输出无法解析（${err.message}），跳过`;
+  }
+  const hits = d.stopSells || [];
+  if (!hits.length) return null;
+
+  const acts = [];
+  for (const s of hits) {
+    if (!(s.sellable > 0)) {
+      acts.push(`${s.code} 触发止损(${s.pnlPct}%)但可卖 0 股（T+1），未下单`);
+      continue;
+    }
+    if (!AUTO) {
+      acts.push(`${s.code} 触发止损 ${s.sellable} 股，未开 --auto 仅记日志`);
+      cli(['note', '--tag', '风控', `[系统任务·${tag}] ${s.code} 触发止损（${s.pnlPct}%），未开 --auto，需人工处置`]);
+      continue;
+    }
+    const r = cli(['sell', s.code, String(s.sellable)]);
+    acts.push(`${s.code} 止损卖出 ${s.sellable} 股：${r.ok ? '成交' : '失败'}`);
+    cli([
+      'note',
+      '--tag',
+      '风控',
+      `[系统任务·${tag}] 止损兜底：${s.code} 触发 -7% 红线（${s.pnlPct}%），` +
+        (r.ok ? `已卖出 ${s.sellable} 股（成交价约 ${s.price}）` : `下单失败：${r.out.replace(/\n+/g, ' ').slice(0, 80)}`),
+    ]);
+  }
+  return `止损兜底(${tag})：${acts.join('；')}`;
 }
 
 function tLiveOn() {

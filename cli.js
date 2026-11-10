@@ -358,11 +358,91 @@ async function cmdStatus() {
   if ((dash.meta.warnings || []).length) console.log(`${C.y}提示${C.x} ${dash.meta.warnings.join('；')}`);
 }
 
-async function cmdRisk() {
+async function cmdRisk(argv = {}) {
   const cfg = loadCfg();
   const dash = await api('/api/dashboard');
   const ctx = riskContext(cfg, dash);
+  const asJson = String(argv.json) === 'true';
+  const r3 = (v) => Math.round(num(v) * 1000) / 1000;
+
+  const rows = [];
+  const stopSells = [];
+  const notes = [];
   let hit = 0;
+
+  for (const p of ctx.positions) {
+    const cost = num(p.cost);
+    const px = num(p.price);
+    const qty = num(p.qty);
+    const avail = num(p.available);
+    const stop = cost * (1 + ctx.stopLossPct);
+    const take = cost * (1 + ctx.takeProfitPct);
+    const isStop = cost > 0 && px > 0 && px <= stop;
+    const isTake = cost > 0 && px > 0 && px >= take;
+    const tags = [];
+    if (isStop) tags.push({ text: `触发止损（≤${stop.toFixed(2)}）`, color: C.r });
+    else if (isTake) tags.push({ text: `触发止盈（≥${take.toFixed(2)}）`, color: C.g });
+    if (num(p.marketValue) > ctx.maxSingleValue * 1.05) tags.push({ text: '超单票上限', color: C.y });
+    if (avail < qty) tags.push({ text: `可卖${avail}股（T+1）`, color: C.d });
+    if (tags.length) hit++;
+    if (isStop) {
+      // 只报能卖的部分：T+1 未解禁时 sellable=0，调用方据此跳过而不是下一张必被拒的单
+      stopSells.push({
+        code: String(p.code),
+        name: p.name,
+        qty,
+        available: avail,
+        sellable: Math.max(0, Math.min(qty, avail)),
+        price: px,
+        cost: r3(cost),
+        stopLine: r3(stop),
+        pnlPct: r3(p.pnlPct),
+      });
+    }
+    rows.push({
+      code: String(p.code),
+      name: p.name,
+      cost: r3(cost),
+      price: px,
+      pnlPct: r3(p.pnlPct),
+      qty,
+      available: avail,
+      stopLine: r3(stop),
+      takeLine: r3(take),
+      isStop,
+      isTake,
+      tags: tags.map((t) => t.text),
+    });
+  }
+
+  const cashPctNow = ctx.equity > 0 ? ctx.cash / ctx.equity : 1;
+  if (ctx.positionCount >= ctx.maxPositions) notes.push(`持仓数已达上限 ${ctx.maxPositions}，只可减仓不可开新仓`);
+  if (cashPctNow < ctx.minCashPct) notes.push(`现金占比 ${(cashPctNow * 100).toFixed(1)}% 低于下限 ${(ctx.minCashPct * 100).toFixed(0)}%`);
+  if (ctx.todayBuy >= ctx.maxDailyBuy * 0.95) notes.push(`今日买入额度已用尽（${money(ctx.todayBuy)}）`);
+
+  if (asJson) {
+    console.log(
+      JSON.stringify(
+        {
+          asOf: new Date().toLocaleString('zh-CN', { hour12: false }),
+          account: {
+            equity: ctx.equity,
+            cash: ctx.cash,
+            positionCount: ctx.positionCount,
+            todayBuy: ctx.todayBuy,
+            maxSingleValue: r3(ctx.maxSingleValue),
+            maxDailyBuy: r3(ctx.maxDailyBuy),
+          },
+          positions: rows,
+          stopSells,
+          notes,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
 
   for (const p of ctx.positions) {
     const cost = num(p.cost);
@@ -375,7 +455,6 @@ async function cmdRisk() {
     if (num(p.marketValue) > ctx.maxSingleValue * 1.05) tags.push(`${C.y}超单票上限${C.x}`);
     const avail = num(p.available);
     if (avail < num(p.qty)) tags.push(`${C.d}可卖${avail}股（T+1）${C.x}`);
-    if (tags.length) hit++;
     console.log(
       `${p.code} ${p.name}　成本 ${cost.toFixed(2)} 现价 ${px.toFixed(2)} ${signColor(p.pnlPct)}${pct(p.pnlPct)}${C.x}　` +
         `止损线 ${stop.toFixed(2)} 止盈线 ${take.toFixed(2)}　${tags.join(' ')}`
@@ -383,10 +462,7 @@ async function cmdRisk() {
   }
 
   if (!ctx.positions.length) console.log('空仓，无持仓风险信号');
-  const cashPctNow = ctx.equity > 0 ? ctx.cash / ctx.equity : 1;
-  if (ctx.positionCount >= ctx.maxPositions) console.log(`${C.y}持仓数已达上限 ${ctx.maxPositions}，只可减仓不可开新仓${C.x}`);
-  if (cashPctNow < ctx.minCashPct) console.log(`${C.y}现金占比 ${(cashPctNow * 100).toFixed(1)}% 低于下限 ${(ctx.minCashPct * 100).toFixed(0)}%${C.x}`);
-  if (ctx.todayBuy >= ctx.maxDailyBuy * 0.95) console.log(`${C.y}今日买入额度已用尽（${money(ctx.todayBuy)}）${C.x}`);
+  for (const n of notes) console.log(`${C.y}${n}${C.x}`);
   console.log(hit ? `\n${hit} 只持仓存在需要处理的信号` : '\n无买卖信号');
 }
 
@@ -1602,7 +1678,7 @@ async function main() {
     if (needServer) await ensureServer();
     switch (cmd) {
       case 'status': await cmdStatus(); break;
-      case 'risk': await cmdRisk(); break;
+      case 'risk': await cmdRisk(argv); break;
       case 'band': await cmdBand(rest, argv); break;
       case 'cond': await cmdCond(rest, argv); break;
       case 'watch': await cmdWatch(rest, argv); break;
