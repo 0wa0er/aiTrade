@@ -1,0 +1,38 @@
+{
+  "_说明": "条件单：到价 / 到点自动委托。status=active 待触发，fired 已执行，expired 过期，cancelled 已撤，error 执行失败待人工。",
+  "seq": 1,
+  "items": [
+    {
+      "id": "C01",
+      "code": "512890",
+      "name": "红利低波ETF华泰柏瑞",
+      "type": "etf",
+      "side": "buy",
+      "qty": 12000,
+      "orderType": "market",
+      "limitPrice": null,
+      "triggers": {
+        "price": {
+          "op": "<=",
+          "value": 1.233
+        }
+      },
+      "mode": "all",
+      "floor": 1.205,
+      "window": {
+        "from": "09:40",
+        "to": "14:50"
+      },
+      "expireOn": "2026-11-10",
+      "note": "回踩MA20建首档；破1.205视为下轨失守不接",
+      "source": "agent",
+      "status": "active",
+      "createdAt": "2026-11-10T00:55:50.191Z",
+      "firedAt": "",
+      "firePrice": null,
+      "attempts": 0,
+      "lastError": "",
+      "result": null
+    }
+  ]
+}

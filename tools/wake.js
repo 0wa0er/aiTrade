@@ -42,6 +42,10 @@ const AGENT = has('agent');
 const AUTO = has('auto');
 const FORCE = has('force');
 
+// 需要「判断」而不只是「执行」的任务段。这三段跑完只是把事实摆齐，
+// 真正的判断由客户端 agent 做（无头 CLI 不参与日常调度）。
+const JUDGE_TASKS = ['plan', 'open', 'tail'];
+
 const TASKS = {
   plan: { needTradable: false, label: '盘前计划', at: '08:45' },
   open: { needTradable: true, label: '开盘执行', at: '09:45' },
@@ -210,7 +214,7 @@ function tPlan() {
   const write = cli(['journal', 'plan', planBody]);
   steps.push(`plan: ${write.out.split('\n')[0]}`);
 
-  cli(['note', '--tag', '计划', `盘前参数卡已生成（观察池 ${codes.length} 只，指标${ind ? '现取成功' : '取数失败'}），待补主观判断`]);
+  cli(['note', '--tag', '计划', `盘前参数卡已生成（观察池 ${codes.length} 只，指标${ind ? '现取成功' : '取数失败'}），主观判断待客户端 agent 补写`]);
   return steps;
 }
 
@@ -368,6 +372,10 @@ function tLiveOff() {
       }
     })();
     logLine(`${task} 完成：${steps.join(' ｜ ')}${agentNote ? `（${agentNote}）` : ''}`);
+    // 机械部分做完不等于任务做完：这三段要判断。无头 CLI 不参与，判断一律回客户端做。
+    if (JUDGE_TASKS.includes(task)) {
+      logLine(`→ 该判断了：打开 WorkBuddy 说「看下今天的盘」，agent 会读 data/journal/${dayKey()}.md 接上现场`);
+    }
   } catch (e) {
     logLine(`${task} 异常：${e.message}`);
     process.exitCode = 1;

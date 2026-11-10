@@ -1240,12 +1240,32 @@ async function cmdCond(rest, argv = {}) {
     }
     const codes = [...new Set(db.items.filter((x) => x.status === 'active').map((x) => x.code))];
     const px = new Map();
+    const nm = new Map();
     if (codes.length) {
       try {
         const q = await api('/api/quotes?secids=' + codes.map(secidOf).join(','));
-        for (const row of q || []) px.set(String(row.code), num(row.price));
+        for (const row of q || []) {
+          px.set(String(row.code), num(row.price));
+          if (row.name) nm.set(String(row.code), String(row.name));
+        }
       } catch {
         /* 服务没起就只显示规则 */
+      }
+    }
+    // 建单时服务未起会让 name 回落成代码，这里顺手补一次，避免清单里只有数字
+    let renamed = 0;
+    for (const it of db.items) {
+      const n = nm.get(it.code);
+      if (n && (!it.name || it.name === it.code)) {
+        it.name = n;
+        renamed += 1;
+      }
+    }
+    if (renamed) {
+      try {
+        K.save(db);
+      } catch {
+        /* 写不进去不影响本次展示 */
       }
     }
     const hhmm = nowHHMM();
@@ -1282,7 +1302,8 @@ async function cmdCond(rest, argv = {}) {
     if (!/^\d{6}$/.test(code || '')) {
       throw new Error(
         '用法：node cli.js cond add 512890 --side buy --qty 8000 [--at 09:45] [--price 1.205 --op ">="] ' +
-          '[--mode all] [--limit 1.21] [--from 09:30] [--to 14:57] [--expire 2026-11-16] --note "理由"'
+          '[--mode all] [--limit 1.21] [--from 09:30] [--to 14:57] [--expire 2026-11-16] --note "理由"\n' +
+          '      回踩买入加保护下限：--price 1.233 --op "<=" --floor 1.205（跌破 1.205 视为破位不接）'
       );
     }
     let name = pick('name', '');
@@ -1303,6 +1324,7 @@ async function cmdCond(rest, argv = {}) {
         at: pick('at', ''),
         price: pick('price', null),
         op: pick('op', '>='),
+        floor: pick('floor', null),
         mode: pick('mode', 'all'),
         orderType: pick('limit', null) != null ? 'limit' : 'market',
         limitPrice: pick('limit', null),

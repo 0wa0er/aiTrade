@@ -228,9 +228,64 @@ ok('损坏的条目不让整个文件读不出来', () => {
   assert.match(db.items[1].lastError, /字段非法/);
 });
 
+// ---------- 价格下限（保护垫）----------
+
+// 回踩买入场景：上限 1.233、数量 12000
+const mkBuy = (extra = {}) => mk({ op: '<=', price: 1.233, qty: 12000, ...extra });
+
+ok('floor 低于上限时正常入库', () => {
+  const it = mkBuy({ floor: 1.205 });
+  assert.strictEqual(it.floor, 1.205);
+  assert.strictEqual(it.triggers.price.op, '<=');
+});
+
+ok('floor 必须低于上限，否则区间为空', () => {
+  assert.throws(() => mkBuy({ floor: 1.233 }), /必须低于上限/);
+  assert.throws(() => mkBuy({ floor: 1.25 }), /必须低于上限/);
+});
+
+ok('floor 只能配 ≤ 上限，方向不匹配直接拒绝', () => {
+  assert.throws(() => mkBuy({ op: '>=', floor: 1.2 }), /方向不匹配/);
+});
+
+ok('floor 为正数校验', () => {
+  assert.throws(() => mkBuy({ floor: 0 }), /必须为正数/);
+  assert.throws(() => mkBuy({ floor: -1 }), /必须为正数/);
+});
+
+ok('区间内到价触发，跌破下限不接', () => {
+  const it = mkBuy({ floor: 1.205 });
+  const at = (price) => K.evaluate(it, { hhmm: '10:00', price, today: TODAY });
+  assert.strictEqual(at(1.233).fire, true, '踩到上限应触发');
+  assert.strictEqual(at(1.220).fire, true, '区间内应触发');
+  assert.strictEqual(at(1.205).fire, true, '正好下限仍算踩住');
+  const below = at(1.198);
+  assert.strictEqual(below.fire, false, '跌破下限不该买');
+  assert.match(below.why, /跌破保护下限/);
+  assert.strictEqual(at(1.240).fire, false, '未回踩不该触发');
+});
+
+ok('floor 在 any 模式下同样是总闸', () => {
+  const it = mkBuy({ floor: 1.205, at: '09:45', mode: 'any' });
+  const below = K.evaluate(it, { hhmm: '09:50', price: 1.19, today: TODAY });
+  assert.strictEqual(below.fire, false, 'any 模式也不能绕过保护下限');
+});
+
+ok('无 floor 时行为不变（向后兼容）', () => {
+  const it = mkBuy(); // ≤1.233，无下限
+  assert.strictEqual(it.floor, null);
+  assert.strictEqual(K.evaluate(it, { hhmm: '10:00', price: 1.20, today: TODAY }).fire, true);
+  // 没有保护垫时，跌破也照买——这正是加 floor 的理由
+  assert.strictEqual(K.evaluate(it, { hhmm: '10:00', price: 1.0, today: TODAY }).fire, true);
+});
+
+ok('describe 显示下限', () => {
+  const s = K.describe(mkBuy({ floor: 1.205 }));
+  assert.match(s, /下限 ≥ 1\.205/);
+});
+
 // 收尾
 try {
   fs.rmSync(TMP, { recursive: true, force: true });
 } catch (e) {}
-
 console.log(`\n通过：${pass} 项通过，${process.exitCode ? 1 : 0} 项失败`);

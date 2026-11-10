@@ -102,6 +102,19 @@ function normalize(raw = {}, opts = {}) {
   }
   if (!triggers.time && !triggers.price) throw new Error('条件单至少要有一个触发条件（--at 到点 或 --price 到价）');
 
+  // 价格下限（保护垫）：只配「≤ 上限」使用，是回踩买入的防接刀条款。
+  // 没有它，跳空暴跌击穿上限时会在深跌处照单成交，把「等回踩」变成「接下落中的刀」。
+  const floorRaw = raw.floor == null || raw.floor === '' ? null : num(raw.floor);
+  let floor = null;
+  if (floorRaw != null) {
+    if (!(floorRaw > 0)) throw new Error('价格下限（--floor）必须为正数');
+    if (!triggers.price || triggers.price.op !== '<=')
+      throw new Error('价格下限只用于「≤ 上限」的回踩买入，方向不匹配');
+    if (floorRaw >= triggers.price.value)
+      throw new Error(`价格下限 ${floorRaw} 必须低于上限 ${triggers.price.value}，否则区间为空`);
+    floor = round(floorRaw);
+  }
+
   // 只有价格条件时，time 缺省意味着「只要在窗口内到价就执行」；
   // 只有时间条件时，price 缺省意味着「到点就以市价执行」。
   const mode = raw.mode === 'any' ? 'any' : 'all';
@@ -146,6 +159,7 @@ function normalize(raw = {}, opts = {}) {
     limitPrice,
     triggers,
     mode,
+    floor,
     window: { from: wFrom, to: wTo },
     expireOn,
     note,
@@ -260,6 +274,16 @@ function evaluate(item, ctx = {}) {
   const hits = {};
   const checks = [];
 
+  // 保护下限先判：跌破就不是「回踩」，是破位，任何模式下都不接
+  if (item.floor != null && price > 0 && price < item.floor - 1e-9) {
+    return {
+      fire: false,
+      why: `现价 ${round(price)} 已跌破保护下限 ${round(item.floor)}（破位不接）`,
+      mark: null,
+      hits,
+    };
+  }
+
   if (item.triggers.time) {
     const hit = hhmm >= item.triggers.time;
     hits.time = hit;
@@ -311,6 +335,7 @@ function describe(item) {
   const bits = [];
   if (item.triggers.time) bits.push(`${item.triggers.time} 到点`);
   if (item.triggers.price) bits.push(`${item.triggers.price.op === '>=' ? '≥' : '≤'} ${round(item.triggers.price.value)}`);
+  if (item.floor != null) bits.push(`下限 ≥ ${round(item.floor)}`);
   const cond = bits.join(item.mode === 'any' ? ' 或 ' : ' 且 ') || '无条件';
   const qty = item.qty == null ? '全部可卖' : `${item.qty}股`;
   const ord = item.orderType === 'limit' ? `限价 ${round(item.limitPrice)}` : '市价';
