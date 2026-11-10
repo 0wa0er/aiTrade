@@ -377,11 +377,19 @@ async function cmdRisk(argv = {}) {
     const avail = num(p.available);
     const stop = cost * (1 + ctx.stopLossPct);
     const take = cost * (1 + ctx.takeProfitPct);
+    // 止盈判据必须与 core/live.js 的 riskSignals 一致，否则人看到的与进程执行的是两套：
+    // 那边是「当日最高曾 ≥+15% 且自高点回落 ≥3%」，这里若只比现价 ≥ 成本×1.15，
+    // 会在一路向上、根本没回落时标「触发止盈」，看着像该卖了其实盯盘不会吭声。
+    const high = Math.max(num(p.high), px);
+    const highGainPct = cost > 0 ? (high / cost - 1) * 100 : 0;
+    const pullPct = high > 0 ? ((high - px) / high) * 100 : 0;
     const isStop = cost > 0 && px > 0 && px <= stop;
-    const isTake = cost > 0 && px > 0 && px >= take;
+    const atTakeLine = cost > 0 && px > 0 && px >= take;
+    const isTake = highGainPct >= ctx.takeProfitPct * 100 - 1e-9 && pullPct >= 3 - 1e-9;
     const tags = [];
     if (isStop) tags.push({ text: `触发止损（≤${stop.toFixed(2)}）`, color: C.r });
-    else if (isTake) tags.push({ text: `触发止盈（≥${take.toFixed(2)}）`, color: C.g });
+    else if (isTake) tags.push({ text: `触发止盈（高点 ${high.toFixed(3)} 曾 +${highGainPct.toFixed(1)}%，已回落 ${pullPct.toFixed(1)}%）`, color: C.g });
+    else if (atTakeLine) tags.push({ text: `已达 +${ctx.takeProfitPct * 100}%，待自高点回落 3%（≤${(high * 0.97).toFixed(3)}）才报止盈`, color: C.g });
     if (num(p.marketValue) > ctx.maxSingleValue * 1.05) tags.push({ text: '超单票上限', color: C.y });
     if (avail < qty) tags.push({ text: `可卖${avail}股（T+1）`, color: C.d });
     if (tags.length) hit++;
@@ -409,8 +417,13 @@ async function cmdRisk(argv = {}) {
       available: avail,
       stopLine: r3(stop),
       takeLine: r3(take),
+      high: r3(high),
+      highGainPct: r3(highGainPct),
+      pullPct: r3(pullPct),
+      marketValue: num(p.marketValue),
       isStop,
       isTake,
+      atTakeLine,
       tags: tags.map((t) => t.text),
     });
   }
@@ -444,20 +457,16 @@ async function cmdRisk(argv = {}) {
     return;
   }
 
-  for (const p of ctx.positions) {
-    const cost = num(p.cost);
-    const px = num(p.price);
-    const stop = cost * (1 + ctx.stopLossPct);
-    const take = cost * (1 + ctx.takeProfitPct);
+  for (const r of rows) {
     const tags = [];
-    if (px <= stop) tags.push(`${C.r}触发止损${C.x}（≤${stop.toFixed(2)}）`);
-    else if (px >= take) tags.push(`${C.g}触发止盈${C.x}（≥${take.toFixed(2)}）`);
-    if (num(p.marketValue) > ctx.maxSingleValue * 1.05) tags.push(`${C.y}超单票上限${C.x}`);
-    const avail = num(p.available);
-    if (avail < num(p.qty)) tags.push(`${C.d}可卖${avail}股（T+1）${C.x}`);
+    if (r.isStop) tags.push(`${C.r}触发止损${C.x}（≤${r.stopLine.toFixed(2)}）`);
+    else if (r.isTake) tags.push(`${C.g}触发止盈${C.x}（高点 ${r.high} 曾 +${r.highGainPct}%，回落 ${r.pullPct}%）`);
+    else if (r.atTakeLine) tags.push(`${C.g}已达 +${ctx.takeProfitPct * 100}%，待自高点回落 3%（≤${(r.high * 0.97).toFixed(3)}）${C.x}`);
+    if (r.marketValue > ctx.maxSingleValue * 1.05) tags.push(`${C.y}超单票上限${C.x}`);
+    if (r.available < r.qty) tags.push(`${C.d}可卖${r.available}股（T+1）${C.x}`);
     console.log(
-      `${p.code} ${p.name}　成本 ${cost.toFixed(2)} 现价 ${px.toFixed(2)} ${signColor(p.pnlPct)}${pct(p.pnlPct)}${C.x}　` +
-        `止损线 ${stop.toFixed(2)} 止盈线 ${take.toFixed(2)}　${tags.join(' ')}`
+      `${r.code} ${r.name}　成本 ${r.cost.toFixed(2)} 现价 ${r.price.toFixed(2)} ${signColor(r.pnlPct)}${pct(r.pnlPct)}${C.x}　` +
+        `止损线 ${r.stopLine.toFixed(2)} 止盈线 ${r.takeLine.toFixed(2)}　${tags.join(' ')}`
     );
   }
 
