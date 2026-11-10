@@ -219,7 +219,6 @@ function tOpen() {
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   const risk = cli(['risk']);
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
-  const quotaLine = (dash.out.match(/风控余量.*$/m) || ['(未取到风控余量)'])[0].trim();
 
   let sold = 0;
   const hits = [...risk.out.matchAll(/止损|止盈/g)].length;
@@ -241,7 +240,6 @@ function tMidday() {
   steps.push(`alert: ${cli(['alert', 'poll', '--check']).out.split('\n')[0]}`);
   const risk = cli(['risk']);
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
-  const quotaLine = (dash.out.match(/风控余量.*$/m) || ['(未取到风控余量)'])[0].trim();
   cli(['note', '--tag', '记录', `[系统任务] 11:25 午间检视：${risk.out.split('\n')[0]}（只卖不买，无动作则不写冗余记录）`]);
   return steps;
 }
