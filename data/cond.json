@@ -26,10 +26,10 @@
       "expireOn": "2026-11-10",
       "note": "回踩MA20建首档；破1.205视为下轨失守不接",
       "source": "agent",
-      "status": "active",
+      "status": "fired",
       "createdAt": "2026-11-10T00:55:50.191Z",
-      "firedAt": "",
-      "firePrice": null,
+      "firedAt": "2026-11-10T01:40:02.362Z",
+      "firePrice": 1.233,
       "attempts": 0,
       "lastError": "",
       "result": null
