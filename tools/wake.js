@@ -185,9 +185,12 @@ function tPlan() {
   const ind = indicators(codes.length ? codes : []);
 
   // 池外候选：机械扫描，只过硬闸门，不做推荐。
-  // 入池要判断，判断归客户端（08:50 那条自动化），这里只提供原料。
-  const fresh = cli(['scan', '--limit', '10', '--fresh'], { timeout: 90000 });
-  steps.push(`scan: ${fresh.out.split('\n')[0]}`);
+  // 三个视角并列摆出来，入池与否归客户端（08:50 那条自动化）判断。
+  const SO = { timeout: 90000 };
+  const scanAmt = cli(['scan', '--limit', '10', '--fresh'], SO);
+  const scanVal = cli(['scan', '--view', 'value', '--limit', '8', '--fresh'], SO);
+  const scanEtf = cli(['scan', '--view', 'etf', '--kw', '红利|低波|股息', '--limit', '8', '--fresh'], SO);
+  steps.push(`scan: 成交额/估值/红利ETF 三视角`);
 
   const planBody = [
     `### 盘前参数卡（${stamp()} 自动生成）`,
@@ -223,11 +226,26 @@ function tPlan() {
     `### 池外候选（${stamp()} 机械扫描，未入池）`,
     '',
     '> 只过硬闸门（板块权限 / 价格 / 涨跌幅 / 成交额 / 能否凑出合规整手），**不含任何推荐**。',
+    '> 三张表是三种看法：成交额榜看资金在哪、估值榜看便宜的、ETF 看同类可替代的。',
     '> 评估后值得跟踪的再入池：`node cli.js watch add <代码> --note "价位 + 信号" --source plan --ttl 5`。',
     '> 「可买 ✗」= 凑不出「≥ 单笔下限 且 ≤ 单票上限」的整手，结构性建不了仓，跳过。',
     '',
+    '**① 成交额榜**（市场在炒什么）',
+    '',
     '```',
-    fresh.out.trim(),
+    scanAmt.out.trim(),
+    '```',
+    '',
+    '**② 低估值榜**（活跃股里 PE 最便宜的一批，防守型策略的主要来源）',
+    '',
+    '```',
+    scanVal.out.trim(),
+    '```',
+    '',
+    '**③ 红利 / 低波 ETF**（与现有持仓同风格的可替代标的）',
+    '',
+    '```',
+    scanEtf.out.trim(),
     '```',
   ].join('\n');
 

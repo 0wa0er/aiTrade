@@ -407,8 +407,45 @@ function feasibleQty(price, minAmt, maxAmt) {
 async function cmdScan(argv) {
   const cfg = loadCfg();
   const sc = cfg.scan || {};
+  const view = String(argv.view || 'amount').toLowerCase();
   const limit = num(argv.limit, 12);
   const fresh = argv.fresh === 'true' || argv.fresh === true;
+
+  // 三个视角的差别只在「取数范围」与「排序依据」，闸门共用
+  const VIEWS = {
+    amount: {
+      label: '成交额榜',
+      fs: 'm:0+t:6,m:0+t:80,m:1+t:2',
+      minPrice: num(sc.minPrice, 3),
+      minAmtYi: num(sc.minAmountYi, 2),
+      pct: sc.pctRange || [-4, 6],
+      sort: null,
+    },
+    // 低估值榜：**不是**全市场 PE 最低（那些基本无法交易），
+    // 而是「成交额前 200 的活跃股里，PE 最便宜的」。
+    // 东财的 fid=f9 排序不可靠（实测 po=0 仍返回 PE 六万多的僵尸股），只能本地排。
+    value: {
+      label: '低估值榜',
+      fs: 'm:1+t:2,m:0+t:6',
+      minPrice: num(sc.minPrice, 3),
+      minAmtYi: num(sc.minAmountYi, 2),
+      pct: null,
+      sort: 'pe',
+      maxPe: 30,
+    },
+    // 场内基金：单价普遍 1~4 元，价格下限要放低，成交额门槛也低一档
+    etf: {
+      label: '场内基金',
+      fs: 'b:MK0021,b:MK0022',
+      minPrice: 0.3,
+      minAmtYi: 0.5,
+      pct: null,
+      sort: null,
+    },
+  };
+  const v = VIEWS[view];
+  if (!v) throw new Error('用法：node cli.js scan [--view amount|value|etf] [--limit N] [--fresh] [--kw "红利|低波"]');
+  const kw = argv.kw && argv.kw !== true ? new RegExp(String(argv.kw)) : null;
 
   // 金额闸门用实时权益算；服务没起就退化，只显示一手金额，不阻断扫描
   let ctx = null;
@@ -429,7 +466,7 @@ async function cmdScan(argv) {
   const fields = 'f2,f3,f5,f6,f8,f9,f12,f14,f20';
   const url =
     `https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=${pz}&po=1&np=1&fltt=2&invt=2&fid=f6` +
-    `&fs=m:0+t:6,m:0+t:80,m:1+t:2&fields=${fields}`;
+    `&fs=${v.fs}&fields=${fields}`;
   const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://quote.eastmoney.com/' } });
   const j = await r.json();
   const list = (j?.data?.diff || []).filter((d) => {
@@ -438,24 +475,46 @@ async function cmdScan(argv) {
     const price = num(d.f2);
     const p = num(d.f3);
     const amount = num(d.f6);
+    const pe = num(d.f9);
     if (!/^\d{6}$/.test(code)) return false;
-    // 账户资质：未开通的板块直接出局（科创板/创业板/北交所/ST/退市整理）
-    if (!R.permissionOf({ code, name, type: 'stock', permissions: cfg.account?.permissions }).allowed) return false;
+    // 账户资质：未开通的板块直接出局（科创板/创业板/北交所/ST/退市整理）。ETF 无板块限制
+    const type = view === 'etf' ? 'fund' : 'stock';
+    if (!R.permissionOf({ code, name, type, permissions: cfg.account?.permissions }).allowed) return false;
     if ((sc.excludeBoards || []).some((b) => code.startsWith(b))) return false;
     if (/N$|C$/.test(name)) return false; // 新股/次新：上市初期无涨跌幅限制，不在候选池
-    if (price < num(sc.minPrice, 3) || price > num(sc.maxPrice, 130)) return false;
-    const [lo, hi] = sc.pctRange || [-4, 6];
-    if (p < lo || p > hi) return false;
-    if (amount < num(sc.minAmountYi, 2) * 1e8) return false;
+    if (price < v.minPrice || price > num(sc.maxPrice, 130)) return false;
+    if (amount < v.minAmtYi * 1e8) return false;
+    if (v.pct) {
+      const [lo, hi] = v.pct;
+      if (p < lo || p > hi) return false;
+    }
+    if (v.sort === 'pe') {
+      if (!(pe > 0 && pe <= v.maxPe)) return false;
+      if (/ST/i.test(name)) return false;
+    }
+    if (view === 'etf') {
+      // 货币/债券 ETF 是现金管理工具，不是投资标的；511 段基本全是这类
+      if (/^511/.test(code)) return false;
+      if (/日利|添益|货币|现金|理财|国债/.test(name)) return false;
+    }
+    // 名称过滤：找同类风格时用，如 `--kw "红利|低波|股息"`
+    if (kw && !kw.test(name)) return false;
     // 池外选股：已在观察池或已持仓的不再重复推
     if (fresh && (held.has(code) || watched.has(code))) return false;
     return true;
   });
+  if (v.sort === 'pe') list.sort((a, b) => num(a.f9) - num(b.f9));
 
   const boards = R.allowedBoards(cfg.account?.permissions).join('、');
+  const cond =
+    view === 'value'
+      ? `活跃股（成交额前 ${pz}）中 PE ≤ ${v.maxPe} 且 > 0，按 PE 升序；价 ${v.minPrice}–${sc.maxPrice}，成交额 ≥${v.minAmtYi} 亿`
+      : view === 'etf'
+        ? `沪深，按成交额降序；价 ≥${v.minPrice}，成交额 ≥${v.minAmtYi} 亿，已排除货币/债券 ETF`
+        : `成交额前列，价 ${v.minPrice}–${sc.maxPrice}，涨幅 ${v.pct.join('%~')}%，成交额 ≥${v.minAmtYi} 亿`;
   console.log(
-    `${C.b}${fresh ? '池外候选' : '候选池'}${C.x}（成交额前列，价 ${sc.minPrice}–${sc.maxPrice}，` +
-      `涨幅 ${(sc.pctRange || []).join('%~')}%，成交额 ≥${sc.minAmountYi} 亿${fresh ? '，已排除持仓与观察池' : ''}）`
+    `${C.b}${fresh ? '池外候选' : '候选池'}·${v.label}${C.x}（${cond}${kw ? `，名称含 ${kw.source}` : ''}` +
+      `${fresh ? '，已排除持仓与观察池' : ''}）`
   );
   console.log(
     `${C.d}可交易范围：${boards}` +
@@ -467,7 +526,7 @@ async function cmdScan(argv) {
     const price = num(d.f2);
     const qty = ctx ? feasibleQty(price, ctx.minTradeAmount, ctx.maxSingleValue) : null;
     if (ctx && !qty) blocked += 1;
-    const able = ctx ? (qty ? `${qty}股` : `${C.y}✗${C.x}`) : '--';
+    const able = ctx ? (qty ? `${qty}${view === 'etf' ? '份' : '股'}` : `${C.y}✗${C.x}`) : '--';
     console.log(
       `${String(i + 1).padStart(2)}. ${d.f12} ${String(d.f14).padEnd(6)}　价 ${String(price.toFixed(2)).padStart(7)}　` +
         `涨 ${signColor(d.f3)}${pct(d.f3)}${C.x}　成交 ${(num(d.f6) / 1e8).toFixed(1)}亿　换手 ${num(d.f8).toFixed(1)}%　` +
@@ -477,7 +536,7 @@ async function cmdScan(argv) {
   if (ctx && blocked) {
     console.log(`${C.d}其中 ${blocked} 只结构性买不了（凑不到「单笔下限以上、单票上限以下」的整手），不必再评估${C.x}`);
   }
-  if (!list.length) console.log('无符合条件标的（可能是极端行情），本时段不动');
+  if (!list.length) console.log('本视角无符合条件标的。换 --view amount|value|etf 看看，或本时段不动');
 }
 
 async function cmdQuote(codes) {
