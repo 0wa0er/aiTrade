@@ -69,6 +69,7 @@ const J = require('./core/journal');
 const B = require('./core/bands');
 const W = require('./core/watch');
 const K = require('./core/cond');
+const T = require('./core/take');
 
 const ROOT = __dirname;
 const DATA = path.join(ROOT, 'data');
@@ -1422,6 +1423,218 @@ async function cmdAlert(rest, argv) {
  * 条件单：到价 / 到点自动委托。
  * 与区间（band）分工：band 只叫醒、落告警；cond 是真下单，但仍走 placeOrder 的风控闸门。
  */
+// ---------------- 移动止盈 ----------------
+
+/** 取日线；失败返回空数组，由调用方降级（宁可这一轮不挂单，也不用假数据算止盈价） */
+async function klineOf(code, lmt = 60) {
+  try {
+    const d = await api(`/api/kline?secid=${secidOf(code)}&kind=day&lmt=${lmt}`);
+    return (d && d.items) || [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 移动止盈：每天按「持仓期最高价 ×(1-回撤)」重算止盈条件单，只上移、绝不下调。
+ *
+ * 为什么不复用 core/live.js 的 take 判据：那条规则要求「当日最高曾达成本 +15% 且自当日高点回落 3%」，
+ * 而 512890 近 250 个交易日单日涨幅 ≥5% 出现 0 次（最大 +3.23%）—— 对宽基/红利 ETF 是永不触发的死规则。
+ * 判据、参数与边界见 core/take.js 顶部注释。
+ *
+ * 子命令：
+ *   take plan    只算不动，打印每只持仓的新止盈价与动作（agent 判断时的输入）
+ *   take sync    算 + 落单。15:15 收盘后与 08:45 盘前各跑一次，幂等
+ *   take status  看现有止盈单离现价多远
+ */
+async function cmdTake(rest, argv = {}) {
+  const sub = rest[0] || 'status';
+  if (!['plan', 'sync', 'status'].includes(sub)) {
+    throw new Error(
+      '用法：node cli.js take plan|sync|status [--json] [--dry-run] [--pull 3] [--safety 2]\n' +
+        '      --pull 回撤容忍(%)，默认按 ATR 自适应；--safety 保本线(%)，默认 2'
+    );
+  }
+  const dryRun = sub === 'plan' || argv['dry-run'] != null;
+  const asJson = argv.json != null;
+  const pick = (k) => (argv[k] != null && argv[k] !== 'true' ? num(argv[k]) : null);
+  const round = (v, d = 3) => Math.round(num(v) * 10 ** d) / 10 ** d;
+
+  const cfg = loadCfg();
+  const dash = await api('/api/dashboard');
+  const ctx = riskContext(cfg, dash);
+  const st = loadState().positions || {};
+  const sess = dash.meta.session || {};
+  const safetyPct = pick('safety') == null ? undefined : pick('safety') / 100;
+  const pullPct = pick('pull') == null ? undefined : pick('pull') / 100;
+  const expireOn = R.nextTradingDateKey(new Date(), holidays(), 20);
+
+  const rows = [];
+  for (const p of ctx.positions) {
+    const pos = st[secidOf(p.code)] || {};
+    const lots = Array.isArray(pos.lots) ? pos.lots.filter((x) => x && x.date) : [];
+    const since = (lots.length ? lots.map((x) => x.date).sort()[0] : pos.openDate) || '';
+    const kl = await klineOf(p.code);
+    const atrPct = T.atrPctOf(kl);
+    // K 线可能不含今日（盘中），用当日最高与现价兜住；三者取大保证不会把最高价算低
+    const high = Math.max(T.highSince(kl, since), num(p.high), num(p.price));
+    const t = T.takeTarget({ cost: p.cost, high, atrPct, safetyPct, pullPct });
+    const existing = K.list({ source: 'take', status: 'active', code: p.code })[0] || null;
+    const d = T.decide({ t, existing, available: num(p.available) });
+    rows.push({ p, since, atrPct, high, t, existing, d, klineOk: kl.length > 0 });
+  }
+
+  const created = [];
+  const raised = [];
+  const cancelled = [];
+  const kept = [];
+  const skipped = [];
+
+  for (const r of rows) {
+    const { p, t, existing, d } = r;
+    if (d.action === 'create') {
+      if (!dryRun) {
+        const item = K.add(
+          {
+            code: p.code,
+            name: p.name,
+            side: 'sell',
+            qty: null, // 留空 = 全部可卖，避免 T+1 部分解禁时因数量不符被拒
+            price: d.price,
+            op: '>=',
+            window: { from: '09:30', to: '14:57' },
+            expireOn,
+            note:
+              `移动止盈：持仓期最高 ${t.high}（+${t.gainPct}%），` +
+              `回撤容忍 ${(t.pull * 100).toFixed(1)}%（ATR ${t.atrPct}%），锁 +${t.lockPct}%`,
+            source: 'take',
+          },
+          { holidays: holidays() }
+        );
+        created.push({ ...r, id: item.id });
+      } else {
+        created.push(r);
+      }
+    } else if (d.action === 'raise') {
+      if (!dryRun) {
+        const item = K.revise(
+          existing.id,
+          {
+            triggers: { price: { op: '>=', value: d.price } },
+            expireOn,
+            why: `持仓期最高 ${t.high} 抬升 → 锁定 +${t.lockPct}%`,
+          },
+          { holidays: holidays() }
+        );
+        raised.push({ ...r, id: item.id });
+      } else {
+        raised.push(r);
+      }
+    } else if (d.action === 'hold') {
+      kept.push(r);
+    } else {
+      skipped.push(r);
+    }
+  }
+
+  // 收尾：持仓已经没了的止盈单必须撤，否则会在清仓后突然挂出一张卖单（可卖 0 股，白记一次失败）
+  const holdCodes = new Set(ctx.positions.map((p) => p.code));
+  for (const it of K.list({ source: 'take', status: 'active' })) {
+    if (holdCodes.has(it.code)) continue;
+    if (!dryRun) K.setStatus(it.id, 'cancelled');
+    cancelled.push({ id: it.id, code: it.code, name: it.name });
+  }
+
+  if (asJson) {
+    console.log(
+      JSON.stringify(
+        {
+          asOf: `${R.fmtDate(new Date())} ${hhmmOf(new Date().toISOString())}`,
+          dryRun,
+          session: sess.code || '',
+          expireOn,
+          positions: rows.map((r) => ({
+            code: r.p.code,
+            name: r.p.name,
+            cost: num(r.p.cost),
+            price: num(r.p.price),
+            available: num(r.p.available),
+            since: r.since,
+            atrPct: r.t.atrPct ?? round(r.atrPct, 2),
+            high: round(r.high),
+            ok: !!r.t.ok,
+            target: r.t.target ?? null,
+            pullPct: r.t.pull != null ? round(r.t.pull * 100, 2) : null,
+            lockPct: r.t.lockPct ?? null,
+            safety: r.t.safety ?? null,
+            reason: r.t.reason || r.d.reason,
+            action: r.d.action,
+            condId: r.existing ? r.existing.id : null,
+            condPrice: r.existing && r.existing.triggers.price ? r.existing.triggers.price.value : null,
+            klineOk: r.klineOk,
+          })),
+          created: created.map((x) => x.p.code),
+          raised: raised.map((x) => `${x.p.code} ${x.existing ? x.existing.triggers.price.value : ''}→${x.d.price}`),
+          cancelled: cancelled.map((x) => x.id),
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (!rows.length) {
+    console.log(`${C.d}空仓，没有需要维护的止盈单${C.x}`);
+    if (cancelled.length) console.log(`${C.y}已撤 ${cancelled.length} 张失去持仓的止盈单${C.x}`);
+    return;
+  }
+
+  console.log(
+    `${C.b}移动止盈${C.x} ${R.fmtDate(new Date())} ${hhmmOf(new Date().toISOString())}` +
+      `${dryRun ? `${C.y}（预览，未落单）${C.x}` : ''}　` +
+      `${C.d}只上移不下调；持仓期最高价定锚${C.x}`
+  );
+  console.log(
+    `${C.d}${padW('标的', 24)}${padW('成本', 8)}${padW('最高(浮盈)', 17)}${padW('ATR', 7)}${padW('回撤', 7)}${padW('止盈价(锁定)', 16)}动作${C.x}`
+  );
+  for (const r of rows) {
+    const { p, t, d } = r;
+    const dp = p.type === 'etf' ? 3 : 2;
+    const name = `${clipW(p.name, 12)}(${p.code})`;
+    const gainPct = num(p.cost) > 0 ? (r.high / num(p.cost) - 1) * 100 : 0;
+    const highCell = r.high ? `${round(r.high)}(${pct(gainPct)})` : '—';
+    const tgtCell = t.ok ? `${t.target}(${pct(t.lockPct)})` : '—';
+    const act =
+      d.action === 'create'
+        ? `${C.g}新建${C.x}`
+        : d.action === 'raise'
+          ? `${C.r}上移${C.x}`
+          : d.action === 'hold'
+            ? `${C.d}保持${C.x}`
+            : d.action === 'wait'
+              ? `${C.y}等解禁${C.x}`
+              : `${C.d}不挂${C.x}`;
+    console.log(
+      `${padW(name, 24)}${padW(num(p.cost).toFixed(dp), 8)}${padW(highCell, 17)}` +
+        `${padW(t.atrPct != null ? `${t.atrPct}%` : '—', 7)}` +
+        `${padW(t.pull != null ? `${(t.pull * 100).toFixed(1)}%` : '—', 7)}` +
+        `${padW(tgtCell, 16)}${act}`
+    );
+    const why = t.ok ? d.reason : t.reason;
+    if (why) console.log(`${' '.repeat(24)}${C.d}${clipW(why, 96)}${C.x}`);
+  }
+
+  if (!dryRun) {
+    const bits = [];
+    if (created.length) bits.push(`新建 ${created.map((x) => x.id).join('、')}`);
+    if (raised.length) bits.push(`上移 ${raised.map((x) => x.id).join('、')}`);
+    if (cancelled.length) bits.push(`撤 ${cancelled.map((x) => x.id).join('、')}`);
+    if (kept.length) bits.push(`保持 ${kept.length} 张`);
+    console.log(`${C.g}✓${C.x} ${bits.length ? bits.join('　') : '无需变更'}　${C.d}有效期至 ${expireOn}${C.x}`);
+  }
+}
+
 async function cmdCond(rest, argv = {}) {
   const sub = rest[0] || 'list';
   const nowHHMM = () => hhmmOf(new Date().toISOString());
@@ -1690,6 +1903,7 @@ async function main() {
       case 'risk': await cmdRisk(argv); break;
       case 'band': await cmdBand(rest, argv); break;
       case 'cond': await cmdCond(rest, argv); break;
+      case 'take': await cmdTake(rest, argv); break;
       case 'watch': await cmdWatch(rest, argv); break;
       case 'live': await cmdLive(rest, argv); break;
       case 'alert': await cmdAlert(rest, argv); break;

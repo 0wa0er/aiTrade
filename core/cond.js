@@ -163,7 +163,8 @@ function normalize(raw = {}, opts = {}) {
     window: { from: wFrom, to: wTo },
     expireOn,
     note,
-    source: raw.source === 'agent' ? 'agent' : 'manual',
+    // take = 移动止盈脚本自动维护的单（每天修正，只上移）；agent = 判断回路下的单；manual = 人工
+    source: ['agent', 'take'].includes(raw.source) ? raw.source : 'manual',
     status,
     createdAt: raw.createdAt || new Date().toISOString(),
     firedAt: raw.firedAt || '',
@@ -171,6 +172,8 @@ function normalize(raw = {}, opts = {}) {
     attempts: Math.max(0, Math.floor(num(raw.attempts))),
     lastError: String(raw.lastError || ''),
     result: raw.result || null,
+    // 修正留痕：止盈线上移的历史（谁、何时、从什么价到什么价、为什么）
+    revisions: Array.isArray(raw.revisions) ? raw.revisions : [],
   };
 }
 
@@ -236,6 +239,63 @@ function remove(idOrCode) {
   db.items = db.items.filter((x) => x.id !== hit.id);
   save(db);
   return hit;
+}
+
+/** 按条件筛选（移动止盈要按 source=take 找自己的单） */
+function list(filter = {}) {
+  const db = load();
+  return db.items.filter(
+    (x) =>
+      (!filter.status || x.status === filter.status) &&
+      (!filter.source || x.source === filter.source) &&
+      (!filter.code || x.code === filter.code) &&
+      (!filter.side || x.side === filter.side)
+  );
+}
+
+/**
+ * 修正一张 active 条件单 —— 供移动止盈每天上移止盈线、续期用。
+ *
+ * 只允许改价格阈值 / 有效期 / 数量 / 理由；标的与方向不在白名单里，
+ * 因为改方向等于换了一张单，应该撤了重下，否则修正留痕会张冠李戴。
+ * 每次修正把「从什么描述到什么描述」压进 revisions，时间线上能看出是哪天抬的线。
+ */
+function revise(idOrCode, patch = {}, opts = {}) {
+  const db = load();
+  const key = String(idOrCode || '').trim();
+  const idx = db.items.findIndex((x) => x.id === key);
+  if (idx < 0) throw new Error(`找不到条件单 ${key}`);
+  const cur = db.items[idx];
+  if (cur.status !== 'active') throw new Error(`条件单 ${cur.id} 状态为 ${cur.status}，只有 active 可修正`);
+
+  const merged = {
+    ...cur,
+    ...patch,
+    // 标的、方向、来源锁定：改它们等于换了一张单，应该撤了重下，
+    // 否则 revisions 里的「从 1.29 改到 1.33」会挂到另一只票名下。
+    code: cur.code,
+    name: cur.name,
+    type: cur.type,
+    side: cur.side,
+    source: cur.source,
+    triggers: { ...cur.triggers, ...(patch.triggers || {}) },
+    window: { ...cur.window, ...(patch.window || {}) },
+  };
+  const next = normalize(merged, { today: opts.today || todayKey() });
+  next.id = cur.id;
+  next.createdAt = cur.createdAt;
+  next.revisions = (cur.revisions || []).concat([
+    {
+      at: new Date().toISOString(),
+      from: describe(cur),
+      to: describe(next),
+      why: String(patch.why || '').trim(),
+    },
+  ]);
+
+  db.items[idx] = next;
+  save(db);
+  return next;
 }
 
 /** 清掉所有已终结的条目（fired/expired/cancelled），error 保留——那是需要人看的 */
@@ -354,6 +414,8 @@ module.exports = {
   find,
   setStatus,
   remove,
+  list,
+  revise,
   prune,
   evaluate,
   scan,

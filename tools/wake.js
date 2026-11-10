@@ -172,6 +172,14 @@ function tPlan() {
   steps.push(`risk: ${risk.out.split('\n')[0]}`);
   const quotaLine = (dash.out.match(/风控余量.*$/m) || ['(未取到风控余量)'])[0].trim();
 
+  // 移动止盈每天修正一次：T+1 昨天买的那批今天解禁，这里才建得出单。
+  // 收盘后 15:15 已按昨日收盘价算过一轮，这里是「补建 + 复核」，幂等，不会重复建单。
+  const take = cli(['take', 'sync'], { timeout: 90000 });
+  const takeTail = take.out.trim().split('\n').filter(Boolean).pop() || '(无输出)';
+  steps.push(`take: ${takeTail}`);
+  // sync 之后再取一次 plan：此时条件单价已是最新，参数卡里贴的就是今天实际生效的线
+  const takePlan = cli(['take', 'plan'], { timeout: 90000 });
+
   const prune = cli(['watch', 'prune']);
   steps.push(`prune: ${prune.out.split('\n')[0]}`);
 
@@ -209,6 +217,16 @@ function tPlan() {
     '```',
     quotaLine,
     risk.out.trim(),
+    '```',
+    '',
+    '**移动止盈（条件单自动维护，只上移不下调）**',
+    '',
+    '> 判据：持仓期最高价 ×(1-回撤容忍)，回撤容忍 = 1.8×ATR 夹在 2.5%~8%。',
+    '> 准入：回撤后的止盈价必须仍在「成本+2%」之上才挂。**这是执行线**，',
+    '> 上面风控里的「止盈 +15%」只是参考目标，不是挂单价格。',
+    '',
+    '```',
+    takePlan.out.trim(),
     '```',
     '',
     '**情景闸门（四档，09:45 用实时数据重判）**',
@@ -313,9 +331,14 @@ function tClose() {
   const steps = [];
   steps.push(`sync: ${cli(['journal', 'sync']).out.split('\n')[0]}`);
   steps.push(`prune: ${cli(['watch', 'prune']).out.split('\n')[0]}`);
+  // 收盘价已定，按今日口径重算移动止盈线：明早开盘前那张单就已经是新的。
+  // 15:15 跑完若持仓为当日买入（T+1），脚本会留成「等解禁」，次日 08:45 首轮补建。
+  const take = cli(['take', 'sync'], { timeout: 90000 });
+  const takeTail = take.out.trim().split('\n').filter(Boolean).pop() || '(无输出)';
+  steps.push(`take: ${takeTail}`);
   steps.push(`index: ${cli(['journal', 'index']).out.split('\n')[0]}`);
   steps.push(`alert: ${cli(['alert', 'poll']).out.split('\n')[0]}`);
-  cli(['note', '--tag', '运维', '[系统任务] 15:15 收盘归档：账户快照已同步、观察池已清理、索引已重建。复盘内容需另行补写']);
+  cli(['note', '--tag', '运维', `[系统任务] 15:15 收盘归档：账户快照已同步、观察池已清理、索引已重建；移动止盈 ${takeTail}`]);
   return steps;
 }
 
