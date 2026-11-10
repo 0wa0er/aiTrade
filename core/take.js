@@ -107,7 +107,9 @@ function takeTarget(o = {}) {
   // 准入：回撤后的止盈价必须仍在保本线之上。
   // 这一条同时替代了「浮盈门槛」—— 浮盈不够时 target 会低于保本线，自然挂不出来。
   if (target < safety - 1e-9) {
-    const needHigh = safety / (1 - pull);
+    // 向上取整到价格最小变动档（0.001）：算出 1.29709 就说 1.298，
+    // 说 1.297 会让人照着挂，而 1.297 其实还差一分钱。
+    const needHigh = Math.ceil((safety / (1 - pull)) * 1000) / 1000;
     return {
       ok: false,
       reason:
