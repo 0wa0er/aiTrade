@@ -17,6 +17,9 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
+// 用于写进 prompt 的工作目录。迁移到别的机器/盘符后，配置里可能还留着旧路径，
+// 渲染时统一改写成本机真实根目录（见 buildPrompt），否则唤醒的 agent 会去读不存在的盘。
+const LOCAL_ROOT = ROOT.replace(/\\/g, '/');
 // TD_DATA_DIR 仅供测试隔离，生产走 data/
 const DATA = process.env.TD_DATA_DIR ? path.resolve(process.env.TD_DATA_DIR) : path.join(ROOT, 'data');
 const CFG_FILE = path.join(DATA, 'bands.json');
@@ -29,7 +32,7 @@ const dayKey = (d = new Date()) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}
 
 const DEFAULT_PROMPT = [
   '【区间触发 · 二次分析】{name}（{code}）现价 {price}，{sideText}。告警号 {alertId}。',
-  '工作目录 D:/workTest/trade-desk，先读 AGENTS.md，再读今日日志。',
+  `工作目录 ${LOCAL_ROOT}，先读 AGENTS.md，再读今日日志。`,
   '只做三件事：',
   '1) node cli.js quote {code} 核对现价与量能，确认不是行情缓存错误；',
   '2) 判断是真突破还是插针噪声：看分时是否回抽、量能是否配合、所属板块是否同步；',
@@ -395,7 +398,10 @@ function buildPrompt(template, band, alert) {
     .replace(/\{lower\}/g, band.lower == null ? '未设' : String(band.lower))
     .replace(/\{sideText\}/g, sideText)
     .replace(/\{alertId\}/g, alert.id || '')
-    .replace(/\{note\}/g, band.note || '');
+    .replace(/\{note\}/g, band.note || '')
+    // 老配置里写死的绝对工作目录（形如 D:/某目录/trade-desk）一律改成本机根目录。
+    // 只认带 trade-desk 结尾的路径，避免误伤正文里其他数字/路径。
+    .replace(/[A-Za-z]:[\\/][^\s，。；）,、]*trade-desk/gi, LOCAL_ROOT);
 }
 
 /**

@@ -93,6 +93,7 @@ node cli.js status                   # ③ 账户、时段、持仓、挂单、�
 | `tools/live.js` | **常驻盯盘进程**（交易时段实时看盘，本地 HTTP 可互动） | 改后手动 `live on --force` 自检 |
 | `tools/wake.js` | **系统唤醒入口**（任务计划调它；只做确定性执行，判断回客户端） | 改后 `wake.js <task>` 单跑一遍 |
 | `tools/install-tasks.ps1` | 注册 / 卸载系统计划任务 | 动系统配置，改前先 `-List` |
+| `tools/migrate.ps1` | 换机器：导出必须带走的运行态 / 新机体检（见 §17） | 只读 + 打包，不动账户 |
 | `cli.js` | 命令行 + **风控闸门** | 改后必须跑 `npm test` |
 | `public/` | 前端（app.js / index.html / style.css） | 截图自检 |
 | `data/autotrade.json` | 风控红线 + **账户资质（`account.permissions`）** | 仅在用户明确要求时；改完即时生效 |
@@ -168,6 +169,10 @@ node cli.js entry 601318            # 回踩档 / 突破档两套方案（股数
 npm test                               # 规则 + 护栏 + 日志 + 区间 + 自选 + 盯盘 + 条件单 + 移动止盈 + 当日基准 + 分级 + 计划审计 + 双档入场，十二套用例
 node server.js                         # 前台起服务（NO_OPEN=1 不开浏览器）
 TD_FORCE_SESSION=1 node server.js      # 收盘后调试区间监控用（忽略交易时段）
+
+# 迁移（换机器，见 §17）
+powershell -ExecutionPolicy Bypass -File tools\migrate.ps1 -Export   # 打包运行态（含 SHA256 清单）
+powershell -ExecutionPolicy Bypass -File tools\migrate.ps1 -Check    # 新机体检
 ```
 
 ## 6. 已知坑（都踩过，别重踩）
@@ -488,6 +493,50 @@ node cli.js take sync --pull 3 --safety 2   # 临时改回撤容忍(%) / 保本�
 - **08:45 不跑**：那时 agent 还没挂单，审了必然报缺口，纯噪声。
 - 处理只有两种：**补单**，或**改计划（删掉价位）**。留着「有计划价、没单子」的条目等于自欺。
 - 同一条命令还会报**孤儿单**：活跃买单的标的已不在观察池也不在持仓（计划改向后的遗留），该撤就撤。
+
+---
+
+## 17. 迁到另一台机器（`tools/migrate.ps1`）
+
+代码、配置、日志、测试全在 git 里，`git clone` 就有；**缺的只有运行态**，因为 `.gitignore` 刻意排除了它们（state.json 每个交易日都变，入库会把提交历史淹成流水账）。
+
+### 17.1 必须带走的（只有三个文件）
+
+| 等级 | 文件 | 为什么 |
+|---|---|---|
+| 必带 | `data/state.json` | 账户真身：现金、持仓、成交、委托、观察池、dayStart 基准、单号 seq。**不带就是 5 万空仓重新开始** |
+| 建议 | `data/bands.state.json` | 区间武装状态，不带会在新机重复告警一次 |
+| 建议 | `data/alerts.json` | 未处理告警队列，不带就丢待办 |
+
+**明确不要带**：
+
+- `data/live/live.pid` —— 盯盘进程锁。带过去新机会以为盯盘已在跑，锁死。
+- `data/live/` 其余 —— 进程快照、事件流水、唤醒日志，纯运行态。
+- `data/regime.state.json` —— 当日分级判定，跨交易日自动失效，明天必须重判。
+- `data/state.bak-*.json`、`data/backup/` —— 手工快照，含账户数字，不入库也别乱拷。
+
+一键导出（含 SHA256 清单）：`powershell -ExecutionPolicy Bypass -File tools\migrate.ps1 -Export`
+
+### 17.2 不在任何文件里的三样东西（最容易漏）
+
+1. **7 个 Windows 计划任务**（`TradeDesk-*`）：新机跑 `powershell -ExecutionPolicy Bypass -File tools\install-tasks.ps1` 重装。脚本用 `$PSScriptRoot`，路径无关；但 node 必须装在 `C:\Program Files\nodejs\node.exe`，**不能是 WorkBuddy 内置 node**（版本号随应用升级变）。
+2. **8 条 WorkBuddy 自动化**（4 条 ACTIVE：08:50 盘前 / 09:45 开盘 / 11:20 午间 / 14:35 尾盘；4 条 PAUSED：08:45 / 10:15 / 13:15 / 15:15）：这是客户端侧配置，**不在仓库里**，必须在对话里逐条重建，`cwd` 指到新仓库路径。prompt 正文取自 `tools/prompts/*.md`。
+3. **westock CLI**（行情数据源）：用户级工具，新机需重装。
+
+### 17.3 换了路径要注意
+
+- `tools/prompts/*.md` 里写着绝对工作目录，路径变了要改（这是给人/agent 看的说明）。
+- `data/bands.json` 的 `agent.promptTemplate` 里也写过路径，但 `core/bands.js` 的 `buildPrompt()` 会在渲染时把任何 `X:/…/trade-desk` 改写成当前根目录，**不必手工改**。
+- `start.bat` / `serve.bat` 用 `%~dp0`，路径无关。
+
+### 17.4 落地后自检
+
+```
+powershell -ExecutionPolicy Bypass -File tools\migrate.ps1 -Check   # 依赖/任务/端口/写死路径
+node cli.js status                                                  # 账户数字对得上？
+npm test                                                            # 十二套 214 项
+node cli.js regime show                                             # 应为「无有效判定」，开盘前重判
+```
 
 ---
 

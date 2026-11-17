@@ -7,6 +7,31 @@
 
 ---
 
+## [2.8.1] 2026-11-17 · 支持迁到另一台机器（运行态导出 + 路径自适应）
+
+### 起因
+
+要换机器。代码/配置/日志/测试都在 git 里，`clone` 就有；但 `.gitignore` 刻意排除了运行态（state.json 每天在变，入库会把提交历史淹成流水账），其中 `data/state.json` 是**账户真身**——不带走等于 5 万空仓重来。另有 7 个系统计划任务和 8 条 WorkBuddy 自动化根本不在文件系统里。
+
+### 新增
+
+1. **`tools/migrate.ps1`** —— 两个动作：
+   - `-Export`：把必须带走的三个运行态文件（`state.json` 必带、`bands.state.json` 与 `alerts.json` 建议带）打成 zip，附 `MANIFEST.txt`（git 提交、node 版本、源目录、每个文件的字节数与 SHA256 前 16 位、以及「不要带哪些、为什么」）。服务在 5193 监听时拒绝导出（state.json 可能正被写入），要 `-Force` 才放行。
+   - `-Check`：新机体检——node 版本与**是否装在标准路径**（计划任务写死 `C:\Program Files\nodejs\node.exe`，WorkBuddy 内置 node 会随应用升级换版本号）、零依赖确认、关键文件齐全度、运行态是否就位（缺 state.json 直接判 FAIL）、遗留 `live.pid`、`TradeDesk-*` 任务数量、写死路径扫描、5193/5194 端口占用。
+2. **`AGENTS.md` §17** —— 迁移清单：必带/勿带/不在文件里的三样（计划任务、WorkBuddy 自动化、westock CLI）、换路径注意点、落地自检四步。
+
+### 变更
+
+1. **`core/bands.js` 的 `buildPrompt()` 会改写工作目录**：模板里任何 `X:/…/trade-desk` 形式的绝对路径，渲染时统一替换成当前仓库根目录（正则只认 `trade-desk` 结尾的路径，避免误伤正文里的数字）。原因：`data/bands.json` 的 `agent.promptTemplate` 里写着 `D:/workTest/trade-desk`，换机器后唤醒的 agent 会去读一个不存在的盘。`DEFAULT_PROMPT` 也改为按 `__dirname` 生成，不再硬编码。
+2. `tools/prompts/*.md` 里的工作目录仍是字面量——那是给人/agent 看的说明，路径变了要手工改（`-Check` 会点名）。
+
+### 已知近似
+
+- 迁移包只含运行态，不含 `data/journal/`（已在 git）与 `data/live/` 历史事件流水（纯运行态，留档价值低）。
+- `-Check` 的写死路径扫描只看 `tools/prompts/*.md` 与 `data/bands.json`，不扫 `data/journal/`（历史日志里的旧路径属正常记录）。
+
+---
+
 ## [2.8.0] 2026-11-17 · 把两周复盘的三条教训落成规则（分级绑定动作 / 双档入场 / 计划审计）
 
 ### 起因
