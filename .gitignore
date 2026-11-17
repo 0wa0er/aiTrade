@@ -15,6 +15,11 @@ data/bands.state.json
 data/alerts.json
 data/agent-runs/
 
+# ---- 市场分级运行时状态 ----
+# 阈值配置在 autotrade.json 的 market 段（入库）；regime.state.json 是当日判定结果，
+# 跨交易日自动失效，属于运行态。
+data/regime.state.json
+
 # ---- 实时盯盘运行时 ----
 # data/live/ 里是进程锁、每轮快照、事件流水和唤醒日志，都是运行态。
 # 计划区归档（data/journal/plan-archive/）是业务记录，要入库，别加进来。
@@ -22,6 +27,8 @@ data/live/
 
 # ---- 账户状态手工备份（含现金与持仓快照，不入库）----
 data/backup/
+# 改名/改基准前临时拷的快照同样是运行态，别顺手提交上去
+data/state.bak-*.json
 
 # ---- WorkBuddy 运行时数据（记忆、自动化快照）----
 .workbuddy/

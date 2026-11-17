@@ -499,6 +499,23 @@ function tLiveOff() {
           logLine(`条件单：${c.out.replace(/\n+/g, ' ｜ ')}`);
         }
       }
+      // 计划审计：计划里写了买点、却没有对应条件单 = 到价也接不到。
+      // 2026-11-11 长电收 29.48 已跌破计划买点 29.90，当日额度全额空闲，却因为没有对应条件单而漏单。
+      // 只在 open / tail 跑：08:45 时 agent 还没挂单，那个时点审必然报缺口，纯噪声。
+      if (task === 'open' || task === 'tail') {
+        const a = cli(['plan', 'audit']);
+        const gapLine = (a.out || '')
+          .split('\n')
+          .filter((l) => /✗|⚠/.test(l))
+          .map((l) => l.trim().replace(/\s+/g, ' '))
+          .join(' ｜ ');
+        if (gapLine) {
+          logLine(`计划审计：${gapLine}`);
+          if (task === 'open') {
+            cli(['note', '--tag', '风控', `[计划审计] 计划有买点但无活跃条件单：${gapLine}。到价也接不到，补单或改计划，二选一`]);
+          }
+        }
+      }
       switch (task) {
         case 'plan':
           return tPlan();
@@ -521,7 +538,7 @@ function tLiveOff() {
     logLine(`${task} 完成：${steps.join(' ｜ ')}${agentNote ? `（${agentNote}）` : ''}`);
     // 机械部分做完不等于任务做完：这三段要判断。无头 CLI 不参与，判断一律回客户端做。
     if (JUDGE_TASKS.includes(task)) {
-      logLine(`→ 该判断了：打开 WorkBuddy 说「看下今天的盘」，agent 会读 data/journal/${dayKey()}.md 接上现场`);
+      logLine(`→ 该判断了：打开 WorkBuddy 说「看下今天的盘」，agent 会读 data/journal/${dayKey()}.md 接上现场；判级别忘 cli.js regime judge`);
     }
   } catch (e) {
     logLine(`${task} 异常：${e.message}`);

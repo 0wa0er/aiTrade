@@ -39,6 +39,7 @@
   "risk": {
     "maxPositions": 3,
     "maxSinglePct": 0.3,
+    "maxSingleBasis": "cost",
     "minTradeAmount": 10000,
     "minCashPct": 0.08,
     "maxDailyBuyPct": 0.3,
@@ -47,6 +48,14 @@
     "maxPricePerShare": 130,
     "forbidST": true,
     "forbidFund": true
+  },
+  "market": {
+    "_说明": "市场风险分级（core/regime.js）。三条判据 ≥quorum 条且跌停 ≥minLimitDown 判 A 级，A 级会被 cli.js guardBuy 真拦住开新仓（单票上限降到权益 20%）。阈值用 2026-11-12/13/16/17 四天真实盘面标定，改前先跑 core/regime.js 注释里那四条。状态由 `node cli.js regime judge` 落在 data/regime.state.json，跨交易日自动失效。",
+    "quorum": 2,
+    "limitDownRatio": 1.5,
+    "minLimitDown": 20,
+    "breadthBelow": 0.25,
+    "gemDropPct": -2
   },
   "scan": {
     "minPrice": 3,

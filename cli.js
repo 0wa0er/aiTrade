@@ -38,6 +38,14 @@
  *   node cli.js cond rm C01 | off C01 | on C01            删除 / 撤销 / 恢复
  *   node cli.js cond prune                                清理已终结记录
  *
+ * 市场分级（A 级会真拦住买入，不只是日志里写一句）：
+ *   node cli.js regime judge --up 1132 --down 4331 --lu 37 --ld 74 --gem -1.73
+ *   node cli.js regime show | regime clear
+ *
+ * 计划执行审计与入场方案（2026-11 两周复盘后加的，防止「计划写了价位却没挂单 / 只等回踩永不成交」）：
+ *   node cli.js plan audit [--strict]      计划买点 vs 活跃条件单，列出到价也接不到的缺口
+ *   node cli.js entry 601318               回踩档 / 突破确认档两套方案（股数、触发价、保护下限）
+ *
  * 实时盯盘（常驻进程，交易时段实时看盘，可互动；只卖不买）：
  *   node cli.js live status                               运行状态 + 盘面快照 + 风控信号
  *   node cli.js live on [--interval 20] [--until 14:30] [--auto]   启动（--auto 才自动执行止损止盈）
@@ -70,6 +78,9 @@ const B = require('./core/bands');
 const W = require('./core/watch');
 const K = require('./core/cond');
 const T = require('./core/take');
+const REG = require('./core/regime');
+const AUDIT = require('./core/audit');
+const ENT = require('./core/entry');
 
 const ROOT = __dirname;
 const DATA = path.join(ROOT, 'data');
@@ -96,6 +107,20 @@ function loadCfg() {
 
 function loadState() {
   return JSON.parse(fs.readFileSync(path.join(DATA, 'state.json'), 'utf8'));
+}
+
+// 市场分级状态：带交易日，跨日自动失效。guardBuy 在买入前读它，
+// 所以这是「分级 → 动作」真正落地的地方，不只是日志里的一句话。
+const REGIME_FILE = path.join(DATA, 'regime.state.json');
+function loadRegime() {
+  try {
+    return JSON.parse(fs.readFileSync(REGIME_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+function saveRegime(st) {
+  fs.writeFileSync(REGIME_FILE, JSON.stringify(st, null, 2));
 }
 
 function holidays() {
@@ -206,22 +231,42 @@ function riskContext(cfg, dash) {
     .filter((t) => t.side === 'buy' && String(t.time).startsWith(tk))
     .reduce((s, t) => s + num(t.amount), 0);
   const positions = dash.positions.filter((p) => num(p.qty) > 0);
+
+  // 市场分级：只认当日状态，过期按常规（不因陈旧状态误伤，也不假装有保护）
+  const regState = loadRegime();
+  const regime = REG.effectiveActions(regState, tk);
+  const basePct = num(risk.maxSinglePct, 0.3);
+  // 分级动作只能收紧、不能放宽：maxSinglePct 取二者较小值
+  const capPct = regime.maxSinglePct != null ? Math.min(basePct, regime.maxSinglePct) : basePct;
+  // 单日买入上限同理跟着收紧：B 级「只建一档」如果单日额度仍是 30%，
+  // 就能「一档 20% + 再加 10%」，等于没限制。
+  const baseDailyPct = num(risk.maxDailyBuyPct, 0.4);
+  const dailyCapPct = Math.min(baseDailyPct, capPct);
+
   return {
     equity,
     cash: num(a.totalCash ?? a.cash),
     maxPositions: num(risk.maxPositions, 3),
-    maxSinglePct: num(risk.maxSinglePct, 0.3),
+    maxSinglePct: capPct,
+    baseSinglePct: basePct,
+    // 单票上限的比较口径：cost = 按建仓成本金额（默认），market = 按浮动市值。
+    // 2026-11 的教训：按市值卡时，512890 的浮盈把市值推到 15,156、超过上限 15,102.90，
+    // 于是连续 4 个交易日「加仓通道结构性关闭」。浮盈是结果，不该反过来限制加仓。
+    maxSingleBasis: String(risk.maxSingleBasis || 'cost'),
+    regime,
+    regimeDate: regState?.date || '',
     minTradeAmount: num(risk.minTradeAmount, 10000),
     minCashPct: num(risk.minCashPct, 0.08),
-    maxDailyBuyPct: num(risk.maxDailyBuyPct, 0.4),
+    maxDailyBuyPct: dailyCapPct,
+    baseDailyPct,
     stopLossPct: num(risk.stopLossPct, -0.07),
     takeProfitPct: num(risk.takeProfitPct, 0.15),
     maxPricePerShare: num(risk.maxPricePerShare, 130),
     positions,
     positionCount: positions.length,
     todayBuy,
-    maxSingleValue: equity * num(risk.maxSinglePct, 0.3),
-    maxDailyBuy: equity * num(risk.maxDailyBuyPct, 0.4),
+    maxSingleValue: equity * capPct,
+    maxDailyBuy: equity * dailyCapPct,
     minCash: equity * num(risk.minCashPct, 0.08),
   };
 }
@@ -281,11 +326,31 @@ function guardBuy({ cfg, ctx, dash, quote, code, name, type, qty, price, market 
     throw new Error(`已有 ${ctx.positionCount} 只持仓，达到上限 ${ctx.maxPositions} 只，先减仓再开新仓`);
   }
 
-  const existing = ctx.positions.find((p) => p.code === code);
-  const afterValue = num(existing?.marketValue) + amount;
-  if (afterValue > ctx.maxSingleValue * 1.001) {
+  // 市场分级闸门：A 级（停止开新仓）在这里真拦，不是只在日志里写一句。
+  // 2026-11-13~17 连续三天判了 A 级、三天都没动作，分级形同装饰 —— 这条就是补那个洞。
+  // 只拦「开新仓」，已有持仓的减仓/止损永远放行。
+  if (isNew && ctx.regime && ctx.regime.openNew === false) {
     throw new Error(
-      `买入后该股 ¥${money(afterValue)}，超过单票上限 ¥${money(ctx.maxSingleValue)}`
+      `市场分级 A 级（${ctx.regimeDate}）：${ctx.regime.hint}。` +
+        `今日禁止开新仓；如判定有误，先修正状态 node cli.js regime clear`
+    );
+  }
+
+  const existing = ctx.positions.find((p) => p.code === code);
+  // 已有持仓用哪个金额和上限比：默认成本金额（cost×qty），可切回市值（risk.maxSingleBasis）
+  const existingValue =
+    ctx.maxSingleBasis === 'market'
+      ? num(existing?.marketValue)
+      : num(existing?.cost) * num(existing?.qty);
+  const afterValue = existingValue + amount;
+  if (afterValue > ctx.maxSingleValue * 1.001) {
+    const basisLabel = ctx.maxSingleBasis === 'market' ? '市值' : '成本金额';
+    const capNote =
+      ctx.maxSinglePct < ctx.baseSinglePct
+        ? `（当前为分级收紧后的 ${(ctx.maxSinglePct * 100).toFixed(0)}%，常规 ${(ctx.baseSinglePct * 100).toFixed(0)}%）`
+        : '';
+    throw new Error(
+      `买入后该股按${basisLabel}计 ¥${money(afterValue)}，超过单票上限 ¥${money(ctx.maxSingleValue)}${capNote}`
     );
   }
 
@@ -321,9 +386,14 @@ async function cmdStatus() {
     ? `　${C.b}归属交易日${C.x} ${dash.meta.tradingDate}`
     : '';
   console.log(`${C.b}时间${C.x} ${realDate} ${dash.meta.serverClock}${tdNote}　${C.b}时段${C.x} ${s.label}（${s.code}）　可委托=${s.accept ? C.g + '是' : C.y + '否'}${C.x}　可撤单=${s.cancelable ? '是' : '否'}`);
+  // 行情不完整 / 基准未落盘时当日盈亏不可信，宁可显示「—」也不显示错数
+  const dayStr =
+    a.dayPnlReady === false
+      ? `${C.d}—（取价不完整，基准待定）${C.x}`
+      : `${signColor(a.dayPnl)}${money(a.dayPnl)} (${pct(a.dayPnlPct)})${C.x}`;
   console.log(
     `${C.b}资产${C.x} 总 ${money(a.totalAsset)}　可用 ${money(a.cash)}　冻结 ${money(a.frozenCash)}　` +
-      `市值 ${money(a.marketValue)}　当日 ${signColor(a.dayPnl)}${money(a.dayPnl)} (${pct(a.dayPnlPct)})${C.x}　` +
+      `市值 ${money(a.marketValue)}　当日 ${dayStr}　` +
       `累计 ${signColor(a.totalPnl)}${money(a.totalPnl)} (${pct(a.totalPnlPct)})${C.x}`
   );
 
@@ -352,9 +422,19 @@ async function cmdStatus() {
     `${C.b}挂单${C.x} ${open.length ? open.map((o) => `${o.id} ${o.name} ${o.side === 'buy' ? '买' : '卖'} ${num(o.qty)}@${o.price} 已成交${num(o.filledQty)}`).join('；') : '无'}`
   );
 
+  const basisText = ctx.maxSingleBasis === 'market' ? '市值计' : '成本计';
+  const tight = ctx.maxSinglePct < ctx.baseSinglePct;
   console.log(
-    `${C.b}风控余量${C.x} 单票上限 ${money(ctx.maxSingleValue)}　今日已买 ${money(ctx.todayBuy)}/${money(ctx.maxDailyBuy)}　` +
+    `${C.b}风控余量${C.x} 单票上限 ${money(ctx.maxSingleValue)}${C.d}（权益 ${(ctx.maxSinglePct * 100).toFixed(0)}%${tight ? `，分级收紧自 ${(ctx.baseSinglePct * 100).toFixed(0)}%` : ''}·${basisText}）${C.x}　` +
+      `今日已买 ${money(ctx.todayBuy)}/${money(ctx.maxDailyBuy)}　` +
       `最低保留现金 ${money(ctx.minCash)}　止损 ${pct(ctx.stopLossPct * 100)}　止盈 ${pct(ctx.takeProfitPct * 100)}`
+  );
+  const rg = ctx.regime || {};
+  const rgColor = rg.openNew === false ? C.r : rg.level === 'B' ? C.y : C.d;
+  console.log(
+    `${C.b}市场分级${C.x} ${rgColor}${rg.level === 'A' ? 'A 级' : rg.level === 'B' ? 'B 级' : '常规'}${C.x}` +
+      `${rg.stale ? `${C.d}（今日未判定，按常规放行；需要时 cli.js regime judge）${C.x}` : `${C.d}（${ctx.regimeDate} 判定）${C.x}`}　` +
+      `${rg.label || ''}${rg.openNew === false ? `${C.r}·今日禁止开新仓${C.x}` : ''}`
   );
   if ((dash.meta.warnings || []).length) console.log(`${C.y}提示${C.x} ${dash.meta.warnings.join('；')}`);
 }
@@ -391,7 +471,9 @@ async function cmdRisk(argv = {}) {
     if (isStop) tags.push({ text: `触发止损（≤${stop.toFixed(2)}）`, color: C.r });
     else if (isTake) tags.push({ text: `触发止盈（高点 ${high.toFixed(3)} 曾 +${highGainPct.toFixed(1)}%，已回落 ${pullPct.toFixed(1)}%）`, color: C.g });
     else if (atTakeLine) tags.push({ text: `已达 +${ctx.takeProfitPct * 100}%，待自高点回落 3%（≤${(high * 0.97).toFixed(3)}）才报止盈`, color: C.g });
-    if (num(p.marketValue) > ctx.maxSingleValue * 1.05) tags.push({ text: '超单票上限', color: C.y });
+    // 超限标签必须与 guardBuy 同口径，否则「显示超限、下单却过」或反过来，人会被自己的面板骗
+    const capBasis = ctx.maxSingleBasis === 'market' ? num(p.marketValue) : num(cost) * num(qty);
+    if (capBasis > ctx.maxSingleValue * 1.05) tags.push({ text: '超单票上限', color: C.y });
     if (avail < qty) tags.push({ text: `可卖${avail}股（T+1）`, color: C.d });
     if (tags.length) hit++;
     if (isStop) {
@@ -1872,6 +1954,181 @@ async function cmdCond(rest, argv = {}) {
 }
 
 // ---------------- 入口 ----------------
+// ---------------- 市场分级（A / B / 常规） ----------------
+async function cmdRegime(rest, argv = {}) {
+  const sub = rest[0] || 'show';
+  const tk = todayKey();
+
+  if (sub === 'clear') {
+    try {
+      fs.unlinkSync(REGIME_FILE);
+    } catch {
+      /* 没有就是没有 */
+    }
+    console.log(`${C.y}已清除市场分级状态${C.x}　买入闸门回到常规（单票 ≤ 权益 30%），今日不再拦截开新仓`);
+    return;
+  }
+
+  if (sub === 'show') {
+    const st = loadRegime();
+    if (!st) {
+      console.log(`${C.d}今日未判定市场分级 → 按常规放行（单票 ≤ 权益 30%）。${C.x}`);
+      console.log(`${C.d}判定：node cli.js regime judge --up 1132 --down 4331 --lu 37 --ld 74 --gem -1.73${C.x}`);
+      return;
+    }
+    const fresh = REG.isFresh(st, tk);
+    const lv = st.level === 'A' ? `${C.r}A 级${C.x}` : st.level === 'B' ? `${C.y}B 级${C.x}` : '常规';
+    console.log(
+      `${C.b}市场分级${C.x} ${lv}　${C.d}判定于 ${st.date} ${st.at || ''}${fresh ? '' : '（已过期，今日按常规）'}${C.x}`
+    );
+    console.log(`${C.b}动作${C.x} ${st.actions?.hint || ''}`);
+    for (const c of st.checks || []) {
+      console.log(`  ${c.hit ? C.y + '●' : C.d + '○'}${C.x} ${c.text}`);
+    }
+    console.log(`${C.d}判定依据：${(st.reasons || []).join('；')}${C.x}`);
+    if (st.inputs) {
+      console.log(
+        `${C.d}输入：涨 ${num(st.inputs.up)}/跌 ${num(st.inputs.down)}　涨停 ${num(st.inputs.limitUp)}/跌停 ${num(st.inputs.limitDown)}　创业板 ${num(st.inputs.gemChangePct).toFixed(2)}%${C.x}`
+      );
+    }
+    return;
+  }
+
+  if (sub === 'judge') {
+    const input = {
+      up: num(argv.up),
+      down: num(argv.down),
+      limitUp: num(argv.lu ?? argv.limitUp),
+      limitDown: num(argv.ld ?? argv.limitDown),
+      gemChangePct: argv.gem == null ? NaN : num(argv.gem, NaN),
+    };
+    if (!(input.up + input.down > 0)) {
+      throw new Error('缺少涨跌家数。用法：regime judge --up 1132 --down 4331 --lu 37 --ld 74 --gem -1.73');
+    }
+    const cfg = loadCfg();
+    const v = REG.judge(input, cfg.market);
+    const at = new Date().toTimeString().slice(0, 5);
+    const st = REG.makeState({ verdict: v, inputs: input, today: tk, at });
+    saveRegime(st);
+
+    const tag = v.level === 'A' ? `${C.r}A 级 · 停止开新仓${C.x}` : v.level === 'B' ? `${C.y}B 级 · 只建一档${C.x}` : `${C.g}常规${C.x}`;
+    console.log(`${C.b}市场分级判定${C.x} ${tag}`);
+    for (const c of v.checks) console.log(`  ${c.hit ? C.y + '●' : C.d + '○'}${C.x} ${c.text}`);
+    console.log(`${C.b}命中${C.x} ${v.hits.hitCount}/3　${C.d}${v.reasons.join('；')}${C.x}`);
+    console.log(`${C.b}动作${C.x} ${v.actions.hint}`);
+    if (v.actions.maxSinglePct != null) {
+      try {
+        const dash = await api('/api/dashboard');
+        const ctx = riskContext(cfg, dash);
+        console.log(`${C.b}生效单票上限${C.x} ${money(ctx.maxSingleValue)}（权益的 ${(v.actions.maxSinglePct * 100).toFixed(0)}%）`);
+      } catch {
+        /* 服务没起也能判定，只是打不出额度 */
+      }
+    }
+    if (v.actions.openNew === false) {
+      console.log(`${C.r}→ 今日买入将被 guardBuy 拦截（开新仓）。修正判定：cli.js regime clear${C.x}`);
+    }
+    console.log(`${C.d}状态已落盘 ${REGIME_FILE}，跨交易日自动失效${C.x}`);
+    return;
+  }
+
+  throw new Error('用法：node cli.js regime judge --up N --down N --lu N --ld N --gem -1.73 ｜ regime show ｜ regime clear');
+}
+
+// ---------------- 计划 ↔ 条件单缺口审计 ----------------
+function cmdPlan(rest, argv = {}) {
+  const sub = rest[0] || 'audit';
+  if (sub !== 'audit') throw new Error('用法：node cli.js plan audit [--strict]');
+
+  const tk = todayKey();
+  const st = loadState();
+  let conds = { items: [] };
+  try {
+    conds = JSON.parse(fs.readFileSync(path.join(DATA, 'cond.json'), 'utf8'));
+  } catch {
+    /* 没有条件单文件 = 一张单都没有 */
+  }
+
+  const r = AUDIT.auditPlanGaps({
+    watchlist: st.watchlist || [],
+    conds,
+    today: tk,
+    positions: Object.values(st.positions || {}).filter((p) => num(p.qty) > 0),
+  });
+
+  console.log(`${C.b}计划 ↔ 条件单缺口审计${C.x}　${tk}　受审计划项 ${r.checked} 个`);
+  if (r.covered.length) {
+    for (const c of r.covered) {
+      console.log(`  ${C.g}✓${C.x} ${c.code} ${c.name}　计划 ${c.planPrice} → ${c.condId} 触发价 ${c.trigPrice}`);
+    }
+  }
+  if (r.gaps.length) {
+    for (const g of r.gaps) {
+      const icon = g.kind === 'no-cond' ? `${C.r}✗ 无单${C.x}` : g.kind === 'orphan-cond' ? `${C.y}⚠ 孤儿单${C.x}` : `${C.y}? 无价位${C.x}`;
+      console.log(`  ${icon} ${g.code} ${g.name}　${g.reason}`);
+    }
+    console.log(
+      `${C.r}结论：${r.gaps.length} 个缺口${C.x}　${C.d}报告「计划有买点」却无对应条件单的标的，价格到了也接不到；补单或改计划，二选一${C.x}`
+    );
+    if (String(argv.strict) === 'true') process.exitCode = 1;
+  } else {
+    console.log(`${C.g}结论：无缺口${C.x}　${C.d}每个计划项都有对应的活跃买单${C.x}`);
+  }
+  return r;
+}
+
+// ---------------- 双档入场方案（回踩 / 突破确认） ----------------
+async function cmdEntry(code, argv = {}) {
+  if (!/^\d{6}$/.test(code || '')) throw new Error('用法：node cli.js entry 601318');
+  const secid = secidOf(code);
+  const type = typeOf(code);
+  const d = await api(`/api/detail?secid=${secid}&code=${code}&type=${type}`);
+  const q = d.quote;
+  if (!q || !(num(q.price) > 0)) throw new Error(`${code} 无行情，稍后重试`);
+
+  const k = await api(`/api/kline?secid=${secid}`);
+  const items = (k.items || []).slice(-20);
+  if (items.length < 5) throw new Error(`${code} 日线不足（${items.length} 根），无法算 MA20/20 日高`);
+  const closes = items.map((x) => num(x.close)).filter((v) => v > 0);
+  const ma20 = closes.reduce((a, b) => a + b, 0) / closes.length;
+  const high20 = items.reduce((m, x) => Math.max(m, num(x.high)), 0);
+
+  const cfg = loadCfg();
+  const dash = await api('/api/dashboard');
+  const ctx = riskContext(cfg, dash);
+  const lot = R.lotOf(code, type);
+  const plan = ENT.entryPlan({
+    price: num(q.price),
+    ma20,
+    high20,
+    maxSingleValue: ctx.maxSingleValue,
+    minTradeAmount: ctx.minTradeAmount,
+    lotStep: lot.step,
+  });
+
+  const dp = type === 'etf' ? 3 : 2;
+  console.log(
+    `${C.b}${code} ${q.name}${C.x}　现价 ${num(q.price).toFixed(dp)}　` +
+      `${C.d}MA20 ${ma20.toFixed(dp)}（${items.length} 日均）　20 日高 ${high20.toFixed(dp)}${C.x}`
+  );
+  console.log(
+    `${C.d}额度：单票上限 ${money(ctx.maxSingleValue)}（权益 ${(ctx.maxSinglePct * 100).toFixed(0)}%·${ctx.maxSingleBasis === 'market' ? '市值计' : '成本计'}）　单笔下限 ${money(ctx.minTradeAmount)}${C.x}`
+  );
+  for (const leg of [plan.pullback, plan.breakout]) {
+    const status = leg.ok ? `${C.g}可挂${C.x}` : `${C.r}不可行${C.x}`;
+    console.log(
+      `  ${C.b}${leg.label}${C.x} ${status}　触发 ${leg.trigger}　保护下限 ${leg.floor}　` +
+        `${leg.qty} 股 / ${money(leg.amount)}${leg.why ? `${C.d}（${leg.why}）${C.x}` : ''}`
+    );
+  }
+  for (const n of plan.notes) console.log(`  ${C.d}· ${n}${C.x}`);
+  console.log(
+    `${C.d}落单：node cli.js cond add ${code} --side buy --qty <上面股数> --price <触发价> --op "<=" --floor <保护下限> --note "..."　` +
+      `突破档用 --op ">="${C.x}`
+  );
+  return { plan, quote: q };
+}
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -1895,12 +2152,17 @@ async function main() {
       cmd === 'note' ||
       cmd === 'alert' ||
       cmd === 'cond' ||
+      cmd === 'regime' ||
+      (cmd === 'plan' && rest[0] !== 'sync') ||
       (cmd === 'band' && rest[0] !== 'status');
     const needServer = cmd && !fileOnly && !(cmd === 'journal' && rest[0] !== 'sync');
     if (needServer) await ensureServer();
     switch (cmd) {
       case 'status': await cmdStatus(); break;
       case 'risk': await cmdRisk(argv); break;
+      case 'regime': await cmdRegime(rest, argv); break;
+      case 'plan': cmdPlan(rest, argv); break;
+      case 'entry': await cmdEntry(rest[0], argv); break;
       case 'band': await cmdBand(rest, argv); break;
       case 'cond': await cmdCond(rest, argv); break;
       case 'take': await cmdTake(rest, argv); break;
