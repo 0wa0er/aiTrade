@@ -1,6 +1,6 @@
 {
   "_说明": "条件单：到价 / 到点自动委托。status=active 待触发，fired 已执行，expired 过期，cancelled 已撤，error 执行失败待人工。",
-  "seq": 1,
+  "seq": 3,
   "items": [
     {
       "id": "C01",
@@ -32,7 +32,74 @@
       "firePrice": 1.233,
       "attempts": 0,
       "lastError": "",
-      "result": null
+      "result": null,
+      "revisions": []
+    },
+    {
+      "id": "C02",
+      "code": "601318",
+      "name": "中国平安",
+      "type": "stock",
+      "side": "buy",
+      "qty": 200,
+      "orderType": "market",
+      "limitPrice": null,
+      "triggers": {
+        "price": {
+          "op": "<=",
+          "value": 52.8
+        }
+      },
+      "mode": "all",
+      "floor": 51.5,
+      "window": {
+        "from": "09:40",
+        "to": "14:50"
+      },
+      "expireOn": "2026-11-11",
+      "note": "回踩MA20/B0LL中轨共振52.72~52.80接首档；破51.50视为跌穿中轨下行，结构作废不接",
+      "source": "agent",
+      "status": "expired",
+      "createdAt": "2026-11-11T01:04:11.980Z",
+      "firedAt": "",
+      "firePrice": null,
+      "attempts": 0,
+      "lastError": "",
+      "result": null,
+      "revisions": []
+    },
+    {
+      "id": "C03",
+      "code": "601318",
+      "name": "中国平安",
+      "type": "stock",
+      "side": "buy",
+      "qty": 200,
+      "orderType": "market",
+      "limitPrice": null,
+      "triggers": {
+        "price": {
+          "op": "<=",
+          "value": 52.9
+        }
+      },
+      "mode": "all",
+      "floor": 51.6,
+      "window": {
+        "from": "09:40",
+        "to": "14:50"
+      },
+      "expireOn": "2026-11-12",
+      "note": "回踩MA20/BOLL中轨共振52.83接首档；破51.60视为跌穿中轨下行，结构作废不接（见今日计划补记09:15）",
+      "source": "agent",
+      "status": "cancelled",
+      "createdAt": "2026-11-12T01:12:08.983Z",
+      "firedAt": "",
+      "firePrice": null,
+      "attempts": 0,
+      "lastError": "",
+      "result": null,
+      "revisions": []
     }
   ]
 }

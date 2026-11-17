@@ -1,5 +1,5 @@
 {
-  "_说明": "价格区间触发器配置。bands 为区间规则（一只票一条），agent 控制触发后是否自动发起二次分析。运行态写入 bands.state.json，告警写入 alerts.json，此文件可随时手改也可用 node cli.js band 维护。",
+  "_说明": "价格区间触发器。bands 为区间规则，agent 为区间触发后自动发起的二次分析（需要本机 codebuddy CLI 已登录）。",
   "pollSeconds": 20,
   "agent": {
     "_说明": "enabled=false 时只做『落盘告警 + 写时间线』，由定时『区间巡检』任务兜底消费；置 true 且本机 CLI 已登录时，触发即起分析进程。",
@@ -14,15 +14,17 @@
       "id": "B01",
       "code": "512890",
       "secid": "1.512890",
-      "name": "红利低波ETF",
+      "name": "红利低波ETF华泰柏瑞",
       "type": "etf",
-      "lower": 1.225,
+      "lower": 1.2,
       "upper": 1.245,
       "action": "analyze",
       "cooldownMin": 30,
       "resetPct": 0.3,
       "enabled": true,
-      "note": "下破 1.225=MA20 失守，防御逻辑失效；上破 1.245 已贴 52 周高 1.254，属追高区"
+      "note": "MA20 1.226 已破并判定贴线噪声，监控线下移至结构位 1.200(BOLL 下轨 1.202 同步)；破 1.200=防御逻辑实质失效，尾盘减半",
+      "createdAt": "2026-11-12T01:54:41.693Z",
+      "lastFiredAt": ""
     },
     {
       "id": "B02",
@@ -30,13 +32,15 @@
       "secid": "1.600900",
       "name": "长江电力",
       "type": "stock",
-      "lower": 29.0,
+      "lower": 29,
       "upper": 29.9,
       "action": "analyze",
       "cooldownMin": 30,
       "resetPct": 0.3,
       "enabled": true,
-      "note": "上破 29.90 为计划第 2 批备选触发价；下破 29.00 表示资金面进一步恶化，作废"
+      "note": "上破 29.90 为计划第 2 批备选触发价；下破 29.00 表示资金面进一步恶化，作废",
+      "createdAt": "",
+      "lastFiredAt": ""
     },
     {
       "id": "B03",
@@ -50,7 +54,9 @@
       "cooldownMin": 60,
       "resetPct": 0.3,
       "enabled": true,
-      "note": "周三批次观察位：8.40 回踩 / 8.60 突破"
+      "note": "周三批次观察位：8.40 回踩 / 8.60 突破",
+      "createdAt": "",
+      "lastFiredAt": ""
     }
   ]
 }
