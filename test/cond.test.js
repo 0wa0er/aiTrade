@@ -182,10 +182,15 @@ ok('失败 1、2 次保持 active，第 3 次转 error', () => {
 
 console.log('条件单 · 存储');
 
+// 存储用例必须走「真实当天」：load() 会用条目 createdAt 的日期（UTC）重算有效期，
+// 若这里写死一个过去的 today，默认 TTL（5 个交易日）会落在今天之前，
+// 条目读回来就被降级成 error——2026-11-17 就是这样炸过一回的（用例写死 11-09，TTL 恰好到 11-16）。
+const LIVE_TODAY = new Date().toISOString().slice(0, 10);
+
 ok('新增分配递增 ID，可查询可删除', () => {
   fs.rmSync(K.FILE, { force: true });
-  const a = K.add({ code: '512890', name: 'A', side: 'buy', qty: 100, price: 1.2, note: 'x' }, { today: TODAY });
-  const b = K.add({ code: '600900', name: 'B', side: 'sell', at: '14:50', note: 'y' }, { today: TODAY });
+  const a = K.add({ code: '512890', name: 'A', side: 'buy', qty: 100, price: 1.2, note: 'x' }, { today: LIVE_TODAY });
+  const b = K.add({ code: '600900', name: 'B', side: 'sell', at: '14:50', note: 'y' }, { today: LIVE_TODAY });
   assert.strictEqual(a.id, 'C01');
   assert.strictEqual(b.id, 'C02');
   assert.strictEqual(K.load().items.length, 2);
@@ -197,9 +202,9 @@ ok('新增分配递增 ID，可查询可删除', () => {
 
 ok('prune 清掉终结项，保留 error 与 active', () => {
   fs.rmSync(K.FILE, { force: true });
-  const a = K.add({ code: '512890', side: 'buy', qty: 100, price: 1.2, note: 'x' }, { today: TODAY });
-  const b = K.add({ code: '600900', side: 'buy', qty: 100, price: 30, note: 'y' }, { today: TODAY });
-  const c = K.add({ code: '601398', side: 'buy', qty: 100, price: 8, note: 'z' }, { today: TODAY });
+  const a = K.add({ code: '512890', side: 'buy', qty: 100, price: 1.2, note: 'x' }, { today: LIVE_TODAY });
+  const b = K.add({ code: '600900', side: 'buy', qty: 100, price: 30, note: 'y' }, { today: LIVE_TODAY });
+  const c = K.add({ code: '601398', side: 'buy', qty: 100, price: 8, note: 'z' }, { today: LIVE_TODAY });
   K.setStatus(a.id, 'fired');
   K.setStatus(b.id, 'error');
   const n = K.prune();

@@ -168,6 +168,10 @@ ok('上移步长：0.4% 与 0.005 元取大', () => {
 
 console.log('移动止盈 · 条件单上移留痕');
 
+// 落盘类用例必须走真实当天：cond.load() 会用条目 createdAt 的日期重算有效期，
+// 写死 2026-11-09 会让默认 5 交易日 TTL 落在 11-16，条目读回来就降级成 error（11-17 炸过）
+const LIVE_TODAY = new Date().toISOString().slice(0, 10);
+
 const mkCond = (over = {}) => ({
   code: '512890',
   name: '红利低波ETF',
@@ -181,12 +185,12 @@ const mkCond = (over = {}) => ({
 
 ok('revise 保留 id/createdAt，并追加一条修正留痕', () => {
   const it = K.add(mkCond({ side: 'sell', qty: null, price: 1.29, note: '移动止盈', source: 'take' }), {
-    today: '2026-11-09',
+    today: LIVE_TODAY,
   });
   const next = K.revise(
     it.id,
     { triggers: { price: { op: '>=', value: 1.33 } }, why: '最高价抬升' },
-    { today: '2026-11-09' }
+    { today: LIVE_TODAY }
   );
   assert.strictEqual(next.id, it.id);
   assert.strictEqual(next.createdAt, it.createdAt);
@@ -198,7 +202,7 @@ ok('revise 保留 id/createdAt，并追加一条修正留痕', () => {
 });
 
 ok('source=take 能被 list 筛出来，普通单不会被当成止盈单', () => {
-  K.add(mkCond({ code: '600000', price: 1.1 }), { today: '2026-11-09' });
+  K.add(mkCond({ code: '600000', price: 1.1 }), { today: LIVE_TODAY });
   const list = K.list({ source: 'take', status: 'active' });
   assert.strictEqual(list.length, 1);
   assert.strictEqual(list[0].code, '512890');
@@ -206,7 +210,7 @@ ok('source=take 能被 list 筛出来，普通单不会被当成止盈单', () =
 
 ok('非 active 的单不允许修正（已触发/已撤的不能改）', () => {
   const it = K.add(mkCond({ code: '600001', side: 'sell', qty: null, price: 1.2, source: 'take' }), {
-    today: '2026-11-09',
+    today: LIVE_TODAY,
   });
   K.setStatus(it.id, 'cancelled');
   assert.throws(() => K.revise(it.id, { triggers: { price: { op: '>=', value: 1.3 } } }), /只有 active 可修正/);
@@ -214,10 +218,10 @@ ok('非 active 的单不允许修正（已触发/已撤的不能改）', () => {
 
 ok('revise 不接受改标的（改方向等于换单，应撤了重下）', () => {
   const it = K.add(mkCond({ code: '600002', side: 'sell', qty: null, price: 1.2, source: 'take' }), {
-    today: '2026-11-09',
+    today: LIVE_TODAY,
   });
   const next = K.revise(it.id, { code: '600003', triggers: { price: { op: '>=', value: 1.3 } } }, {
-    today: '2026-11-09',
+    today: LIVE_TODAY,
   });
   assert.strictEqual(next.code, '600002');
 });
