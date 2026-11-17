@@ -137,7 +137,10 @@ function renderAccount() {
     cash: fmt(a.cash),
     frozenCash: fmt(a.frozenCash || 0),
     marketValue: fmt(a.marketValue),
-    dayPnl: `${sign(a.dayPnl)}${fmt(a.dayPnl)} (${fmtPct(a.dayPnlPct)})`,
+    dayPnl:
+      a.dayPnlReady === false
+        ? '—（基准待定）'
+        : `${sign(a.dayPnl)}${fmt(a.dayPnl)} (${fmtPct(a.dayPnlPct)})`,
     totalPnl: `${sign(a.totalPnl)}${fmt(a.totalPnl)} (${fmtPct(a.totalPnlPct)})`,
   };
   Object.entries(map).forEach(([k, v]) => {
@@ -913,9 +916,10 @@ function renderBottom() {
     const ps = S.dash.positions;
     const totalPnl = ps.reduce((s, p) => s + p.pnl, 0);
     const dayPnl = ps.reduce((s, p) => s + p.dayPnl, 0);
+    const dayPnlOk = ps.every((p) => p.dataState === 'ok');
     sum.innerHTML = `<span>持仓 <b>${ps.length}</b></span>
       <span>浮动盈亏 <b class="${cls(totalPnl)}">${sign(totalPnl)}${fmt(totalPnl)}</b></span>
-      <span>持仓当日 <b class="${cls(dayPnl)}">${sign(dayPnl)}${fmt(dayPnl)}</b></span>`;
+      <span>持仓当日 <b class="${dayPnlOk ? cls(dayPnl) : 'flat'}">${dayPnlOk ? `${sign(dayPnl)}${fmt(dayPnl)}` : '—'}</b></span>`;
     if (!ps.length) {
       body.innerHTML = '<div class="empty">暂无持仓，在右侧下单面板买入建仓</div>';
       return;
@@ -938,7 +942,7 @@ function renderBottom() {
           <td>${fmt(p.marketValue)}</td>
           <td class="${cls(p.pnl)}">${sign(p.pnl)}${fmt(p.pnl)}</td>
           <td class="${cls(p.pnl)}">${fmtPct(p.pnlPct)}</td>
-          <td class="${cls(p.dayPnl)}">${sign(p.dayPnl)}${fmt(p.dayPnl)}</td>
+          <td class="${cls(p.dayPnl)}">${p.dataState === 'ok' ? `${sign(p.dayPnl)}${fmt(p.dayPnl)}` : '—'}</td>
           <td><div class="ops">
             <button class="buy" data-act="buy" data-secid="${p.secid}">买</button>
             <button class="sell" data-act="sell" data-secid="${p.secid}">卖</button>

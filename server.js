@@ -27,6 +27,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const R = require('./core/rules');
+const PNL = require('./core/pnl');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -638,7 +639,9 @@ function loadState() {
     if (!Array.isArray(st.trades)) st.trades = [];
     if (!Array.isArray(st.actions)) st.actions = [];
     if (!Number.isFinite(st.frozenCash)) st.frozenCash = 0;
-    if (!st.dayStart) st.dayStart = { date: tradingDateKey(), equity: st.cash || 0 };
+    // 遗留 state 没有 dayStart：留 null 交给 buildDashboard 用昨收价还原基准，
+    // 不要拿现金凑数（会把持仓市值漏掉）
+    if (!st.dayStart) st.dayStart = { date: tradingDateKey(), equity: null };
     if (!Number.isFinite(st.seq)) st.seq = st.trades.length + 1;
     if (!Number.isFinite(st.orderSeq)) st.orderSeq = st.orders.length + 1;
     for (const p of Object.values(st.positions)) normalizePosition(p);
@@ -1560,19 +1563,30 @@ async function buildDashboard() {
   });
 
   const totalAsset = round(st.cash + st.frozenCash + marketValue, 2);
+  const sess = sessionState();
 
-  if (st.dayStart?.equity == null) {
+  // 日初权益基准（dayStart.equity）—— 当日盈亏的分母
+  // 算法与两条硬约束见 core/pnl.js 顶部注释（11-17 基准被写成成本市值，当日盈亏退化成累计浮盈）
+  const valComplete = positions.every((p) => p.dataState === 'ok' && p.preClose > 0);
+  const baseCalc = PNL.dayStartBaseline({ totalAsset, positions });
+  let dayStartEq = st.dayStart?.equity ?? null;
+  if (dayStartEq == null && baseCalc.ready) {
+    const base = baseCalc.baseline;
     await exclusive(async () => {
       const fresh = loadState();
       if (fresh.dayStart?.date === todayKey && fresh.dayStart.equity == null) {
-        fresh.dayStart.equity = totalAsset;
+        fresh.dayStart.equity = base;
         saveState(fresh);
       }
     });
-    st.dayStart.equity = totalAsset;
+    // 并发下别人可能已经写入，以落盘值为准
+    dayStartEq = loadState().dayStart?.equity ?? base;
+    st.dayStart = { ...(st.dayStart || {}), date: todayKey, equity: dayStartEq };
   }
 
-  const sess = sessionState();
+  // 基准缺失（行情整天不通）或本轮取价不完整（成本兜底）时，当日盈亏不可信，输出 null 让上层显示「—」
+  const dayPnlReady = valComplete && dayStartEq != null;
+
   if (warnings.length) console.warn('[dashboard]', warnings.join(' / '));
 
   return {
@@ -1585,8 +1599,10 @@ async function buildDashboard() {
       initialCapital: st.initialCapital,
       totalPnl: round(totalAsset - st.initialCapital, 2),
       totalPnlPct: round((totalAsset / st.initialCapital - 1) * 100, 2),
-      dayPnl: round(totalAsset - (st.dayStart?.equity ?? totalAsset), 2),
-      dayPnlPct: st.dayStart?.equity ? round((totalAsset / st.dayStart.equity - 1) * 100, 2) : 0,
+      dayPnl: dayPnlReady ? round(totalAsset - dayStartEq, 2) : null,
+      dayPnlPct: dayPnlReady && dayStartEq ? round((totalAsset / dayStartEq - 1) * 100, 2) : null,
+      dayPnlReady,
+      dayStartEquity: dayStartEq,
       positionCount: positions.length,
       openOrders: liveOrders(st).length,
     },
